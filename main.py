@@ -3626,10 +3626,16 @@ async def deliver_profile(
     reply_markup=None,
     prefix: str = "",
     reveal_contacts: bool = True,
+    force_photo: bool = False,
 ) -> None:
     body = profile_text(profile, reveal_contacts=reveal_contacts)
     text = f"{prefix}\n\n{body}" if prefix else body
-    photo = profile_photo_source(profile["photo_file_id"])
+    photo_id = (profile["photo_file_id"] or "").strip()
+
+    if force_photo and not photo_id:
+        photo_id = BLACK_SQUARE_PHOTO
+
+    photo = profile_photo_source(photo_id)
 
     if photo and len(text) <= 1024:
         try:
@@ -3646,18 +3652,45 @@ async def deliver_profile(
                 f"{profile['user_id']} в {chat_id}: {error}"
             )
 
+            if force_photo and photo_id != BLACK_SQUARE_PHOTO:
+                try:
+                    await bot.send_photo(
+                        chat_id,
+                        photo=profile_photo_source(BLACK_SQUARE_PHOTO),
+                        caption=text,
+                        reply_markup=reply_markup,
+                    )
+                    return
+                except Exception as fallback_error:
+                    print(
+                        f"Чёрный квадрат для {chat_id}: {fallback_error}"
+                    )
+
     if photo:
         try:
             await bot.send_photo(
                 chat_id,
-                photo=profile_photo_source(profile["photo_file_id"]),
+                photo=profile_photo_source(photo_id),
             )
         except Exception as error:
             print(
                 f"Фото анкеты {profile['user_id']} "
                 f"недоступно для {chat_id}: {error}"
             )
-            text += "\n\n⚠️ Фото анкеты недоступно."
+
+            if force_photo and photo_id != BLACK_SQUARE_PHOTO:
+                try:
+                    await bot.send_photo(
+                        chat_id,
+                        photo=profile_photo_source(BLACK_SQUARE_PHOTO),
+                    )
+                except Exception as fallback_error:
+                    print(
+                        f"Чёрный квадрат для {chat_id}: {fallback_error}"
+                    )
+                    text += "\n\n⚠️ Фото анкеты недоступно."
+            else:
+                text += "\n\n⚠️ Фото анкеты недоступно."
 
     if len(text) > 4096:
         text = text[:4095] + "…"
@@ -5175,20 +5208,10 @@ async def notify_match(
     if not first or not second:
         return
 
-    text_first = (
-        "🎉 У вас взаимный лайк!\n\n"
-        f"{profile_text(second)}"
-    )
-
-    text_second = (
-        "🎉 У вас взаимный лайк!\n\n"
-        f"{profile_text(first)}"
-    )
-
-    for user_id, text, other_id in [
-        (first_id, text_first, second_id),
-        (second_id, text_second, first_id),
-    ]:
+    for user_id, other, other_id in (
+        (first_id, second, second_id),
+        (second_id, first, first_id),
+    ):
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
                 [
@@ -5201,10 +5224,13 @@ async def notify_match(
         )
 
         try:
-            await bot.send_message(
+            await deliver_profile(
+                bot,
                 user_id,
-                text,
+                other,
                 reply_markup=keyboard,
+                prefix="🎉 У вас взаимный лайк!",
+                force_photo=True,
             )
         except Exception as error:
             print(
