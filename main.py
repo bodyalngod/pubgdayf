@@ -38,7 +38,13 @@ from aiogram.types import (
 # ============================================================
 
 TOKEN = os.getenv("BOT_TOKEN", "").strip()
-DB_FILE = "pubg_bot.sqlite3"
+# Рядом с pubg_bot.py, а не в «текущей папке» процесса.
+# На хостинге можно переопределить: DB_FILE=/data/pubg_bot.sqlite3
+_DEFAULT_DB_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "pubg_bot.sqlite3",
+)
+DB_FILE = os.path.abspath(os.getenv("DB_FILE", "").strip() or _DEFAULT_DB_FILE)
 
 ADMIN_IDS = {
     int(value.strip())
@@ -328,6 +334,7 @@ FIELD_OPTIONS = {
 # БАЗА ДАННЫХ
 # ============================================================
 
+os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
 DB = sqlite3.connect(DB_FILE)
 DB.row_factory = sqlite3.Row
 
@@ -7902,6 +7909,7 @@ async def main():
         )
 
     init_database()
+    print(f"База данных: {DB_FILE}", flush=True)
     sync_all_referral_premium()
 
     bot = Bot(
