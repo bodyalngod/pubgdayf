@@ -5855,6 +5855,26 @@ async def admin_callback(
             """
         ).fetchone()["count"]
 
+        seen_cutoff = (
+            datetime.now(timezone.utc) - timedelta(hours=24)
+        ).isoformat()
+        active_users = DB.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM users
+            WHERE last_seen > ?
+            """,
+            (seen_cutoff,),
+        ).fetchone()["count"]
+        inactive_users = DB.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM users
+            WHERE last_seen <= ?
+            """,
+            (seen_cutoff,),
+        ).fetchone()["count"]
+
         await callback.answer()
 
         if callback.message:
@@ -5863,7 +5883,11 @@ async def admin_callback(
                 "📊 <b>Статистика</b>\n\n"
                 f"Всего анкет: {total}\n"
                 f"Активных анкет: {active}\n"
-                f"Открытых жалоб: {reports}",
+                f"Открытых жалоб: {reports}\n\n"
+                f"Активных пользователей: {active_users}\n"
+                "действовали менее суток назад\n"
+                f"Неактивных пользователей: {inactive_users}\n"
+                "не взаимодействовали более суток",
                 reply_markup=admin_keyboard(),
             )
 
