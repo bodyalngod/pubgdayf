@@ -7,6 +7,7 @@ import asyncio
 import html
 import os
 import re
+import shutil
 import sqlite3
 import struct
 import time
@@ -38,13 +39,70 @@ from aiogram.types import (
 # ============================================================
 
 TOKEN = os.getenv("BOT_TOKEN", "").strip()
-# Рядом с pubg_bot.py, а не в «текущей папке» процесса.
-# На хостинге можно переопределить: DB_FILE=/data/pubg_bot.sqlite3
-_DEFAULT_DB_FILE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "pubg_bot.sqlite3",
-)
-DB_FILE = os.path.abspath(os.getenv("DB_FILE", "").strip() or _DEFAULT_DB_FILE)
+DB_NAME = "pubg_bot.sqlite3"
+
+
+def resolve_db_file() -> str:
+    """Bothost хранит базу только в /app/data (переменная DATA_DIR).
+
+    Файл рядом с кодом панель «База данных бота» не видит и затирает
+    при обновлении. Явный путь: DATABASE_PATH, DB_PATH или DB_FILE.
+    """
+    explicit = (
+        os.getenv("DATABASE_PATH", "").strip()
+        or os.getenv("DB_PATH", "").strip()
+        or os.getenv("DB_FILE", "").strip()
+    )
+    if explicit:
+        return os.path.abspath(explicit)
+
+    data_dir = os.getenv("DATA_DIR", "").strip()
+    if not data_dir and os.path.isdir("/app/data"):
+        data_dir = "/app/data"
+
+    if data_dir:
+        return os.path.abspath(os.path.join(data_dir, DB_NAME))
+
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), DB_NAME)
+
+
+def adopt_existing_database(target: str) -> None:
+    """Если в data базы ещё нет, забираем уже залитый файл рядом с ботом."""
+    if os.path.isfile(target) and os.path.getsize(target) > 0:
+        return
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(script_dir, DB_NAME),
+        os.path.join(os.getcwd(), DB_NAME),
+        os.path.join("/app", DB_NAME),
+    ]
+    target_abs = os.path.abspath(target)
+    seen: set[str] = set()
+
+    for source in candidates:
+        source_abs = os.path.abspath(source)
+        if source_abs in seen or source_abs == target_abs:
+            continue
+        seen.add(source_abs)
+        if not os.path.isfile(source_abs) or os.path.getsize(source_abs) <= 0:
+            continue
+
+        os.makedirs(os.path.dirname(target_abs), exist_ok=True)
+        shutil.copy2(source_abs, target_abs)
+        for suffix in ("-wal", "-shm"):
+            extra = source_abs + suffix
+            if os.path.isfile(extra):
+                shutil.copy2(extra, target_abs + suffix)
+        print(
+            f"База перенесена в постоянную папку: {source_abs} -> {target_abs}",
+            flush=True,
+        )
+        return
+
+
+DB_FILE = resolve_db_file()
+adopt_existing_database(DB_FILE)
 
 ADMIN_IDS = {
     int(value.strip())
