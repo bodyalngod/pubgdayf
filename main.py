@@ -1,5 +1,7 @@
 # Зависимость: pip install "aiogram>=3.13,<4"
-# Запуск: BOT_TOKEN=123:abc ADMIN_IDS=111,222 python pubg_bot.py
+# Запуск: BOT_TOKEN=123:abc ADMIN_IDS=111,222 SUPERADMIN_IDS=111 python pubg_bot.py
+# Если SUPERADMIN_IDS не задан, супер-админами считаются ADMIN_IDS.
+# Снятие админа из ADMIN_IDS делается в панели супер-админа и хранится в базе.
 
 import asyncio
 import html
@@ -44,9 +46,16 @@ ADMIN_IDS = {
     if value.strip().isdigit()
 }
 
+# Пустой SUPERADMIN_IDS = все ADMIN_IDS являются супер-админами.
+SUPERADMIN_IDS = {
+    int(value.strip())
+    for value in os.getenv("SUPERADMIN_IDS", "").split(",")
+    if value.strip().isdigit()
+}
+
 router = Router()
 
-BIO_MIN_LENGTH = 20
+COLLECTION_MAX = 100
 BLACK_SQUARE_PHOTO = "black_square"
 _BLACK_SQUARE_PNG: bytes | None = None
 
@@ -108,6 +117,7 @@ class ProfileForm(StatesGroup):
     server = State()
     mode = State()
     rank = State()
+    collection = State()
     voice = State()
     schedule = State()
     language = State()
@@ -124,6 +134,7 @@ class AdminProfileForm(StatesGroup):
     server = State()
     mode = State()
     rank = State()
+    collection = State()
     voice = State()
     schedule = State()
     language = State()
@@ -148,6 +159,14 @@ class PremiumAdminForm(StatesGroup):
     query = State()
 
 
+class SuperAdminForm(StatesGroup):
+    admin_query = State()
+
+
+class TikTokForm(StatesGroup):
+    link = State()
+
+
 PROFILE_FIELDS = [
     "nickname",
     "gender",
@@ -156,6 +175,7 @@ PROFILE_FIELDS = [
     "server",
     "mode",
     "rank",
+    "collection",
     "voice",
     "schedule",
     "language",
@@ -171,6 +191,7 @@ PROFILE_STATES = {
     "server": ProfileForm.server,
     "mode": ProfileForm.mode,
     "rank": ProfileForm.rank,
+    "collection": ProfileForm.collection,
     "voice": ProfileForm.voice,
     "schedule": ProfileForm.schedule,
     "language": ProfileForm.language,
@@ -186,6 +207,7 @@ ADMIN_PROFILE_STATES = {
     "server": AdminProfileForm.server,
     "mode": AdminProfileForm.mode,
     "rank": AdminProfileForm.rank,
+    "collection": AdminProfileForm.collection,
     "voice": AdminProfileForm.voice,
     "schedule": AdminProfileForm.schedule,
     "language": AdminProfileForm.language,
@@ -207,6 +229,7 @@ FIELD_NAMES = {
     "server": "Сервер",
     "mode": "Игровой режим",
     "rank": "Ранг",
+    "collection": "Уровень коллекции",
     "voice": "Микрофон",
     "schedule": "Время игры",
     "language": "Язык общения",
@@ -217,6 +240,21 @@ FIELD_NAMES = {
 
 AGE_MIN = 6
 AGE_MAX = 66
+COLLECTION_MIN = 0
+
+
+def normalize_collection(value: str) -> str | None:
+    raw = str(value).strip()
+
+    if not raw.isdigit():
+        return None
+
+    number = int(raw)
+
+    if number < COLLECTION_MIN or number > COLLECTION_MAX:
+        return None
+
+    return str(number)
 
 GENDER_VALUES = {
     "мужской": "Мужской",
@@ -310,6 +348,7 @@ def init_database() -> None:
             server TEXT NOT NULL,
             mode TEXT NOT NULL,
             rank TEXT NOT NULL,
+            collection TEXT,
             voice TEXT NOT NULL,
             schedule TEXT NOT NULL,
             language TEXT NOT NULL,
@@ -390,6 +429,51 @@ def init_database() -> None:
             user_id INTEGER PRIMARY KEY,
             sent TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS admins (
+            user_id INTEGER PRIMARY KEY,
+            appointed_by INTEGER,
+            created TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS revoked_env_admins (
+            user_id INTEGER PRIMARY KEY,
+            revoked_by INTEGER,
+            created TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS username_view_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            admin_id INTEGER NOT NULL,
+            admin_username TEXT,
+            target_id INTEGER NOT NULL,
+            target_username TEXT,
+            profile_nickname TEXT,
+            created TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS tiktok_submissions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            link TEXT NOT NULL,
+            created TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_tiktok_user
+            ON tiktok_submissions(user_id);
+
+        CREATE TABLE IF NOT EXISTS pending_referrals (
+            referred_id INTEGER PRIMARY KEY,
+            referrer_id INTEGER NOT NULL,
+            created TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS daily_views (
+            user_id INTEGER NOT NULL,
+            target_id INTEGER NOT NULL,
+            day TEXT NOT NULL,
+            PRIMARY KEY (user_id, target_id, day)
+        );
         """
     )
 
@@ -420,6 +504,11 @@ def init_database() -> None:
             "ALTER TABLE profiles ADD COLUMN boosted INTEGER NOT NULL DEFAULT 0"
         )
 
+    if "collection" not in columns:
+        DB.execute(
+            "ALTER TABLE profiles ADD COLUMN collection TEXT"
+        )
+
     message_columns = {
         row["name"]
         for row in DB.execute(
@@ -448,8 +537,248 @@ def get_profile(user_id: int):
     ).fetchone()
 
 
+def is_env_admin_revoked(user_id: int) -> bool:
+    try:
+        row = DB.execute(
+            "SELECT 1 FROM revoked_env_admins WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return False
+
+    return row is not None
+
+
+def clear_env_admin_revocation(user_id: int) -> None:
+    try:
+        DB.execute(
+            "DELETE FROM revoked_env_admins WHERE user_id = ?",
+            (user_id,),
+        )
+    except sqlite3.OperationalError:
+        return
+
+
+def revoke_env_admin(user_id: int, revoked_by: int) -> None:
+    DB.execute(
+        """
+        INSERT INTO revoked_env_admins (
+            user_id,
+            revoked_by,
+            created
+        )
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            revoked_by = excluded.revoked_by,
+            created = excluded.created
+        """,
+        (user_id, revoked_by, current_time()),
+    )
+    DB.commit()
+
+
+def is_superadmin(user_id: int) -> bool:
+    if user_id in SUPERADMIN_IDS:
+        return True
+
+    if SUPERADMIN_IDS:
+        return False
+
+    return user_id in ADMIN_IDS and not is_env_admin_revoked(user_id)
+
+
+def is_db_admin(user_id: int) -> bool:
+    try:
+        row = DB.execute(
+            "SELECT 1 FROM admins WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return False
+
+    return row is not None
+
+
 def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
+    if is_superadmin(user_id):
+        return True
+
+    if user_id in ADMIN_IDS and not is_env_admin_revoked(user_id):
+        return True
+
+    return is_db_admin(user_id)
+
+
+def get_user_row(user_id: int):
+    return DB.execute(
+        """
+        SELECT *
+        FROM users
+        WHERE user_id = ?
+        """,
+        (user_id,),
+    ).fetchone()
+
+
+def stored_username(user_id: int) -> str:
+    row = get_user_row(user_id)
+
+    if not row:
+        return ""
+
+    return str(row["username"] or "").strip()
+
+
+def grant_admin(user_id: int, appointed_by: int) -> None:
+    clear_env_admin_revocation(user_id)
+    DB.execute(
+        """
+        INSERT INTO admins (
+            user_id,
+            appointed_by,
+            created
+        )
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            appointed_by = excluded.appointed_by,
+            created = excluded.created
+        """,
+        (user_id, appointed_by, current_time()),
+    )
+    DB.commit()
+
+
+def revoke_admin(user_id: int) -> None:
+    DB.execute(
+        "DELETE FROM admins WHERE user_id = ?",
+        (user_id,),
+    )
+    DB.commit()
+
+
+def users_blocked(first_id: int, second_id: int) -> bool:
+    row = DB.execute(
+        """
+        SELECT 1
+        FROM blocks
+        WHERE
+            (blocker = ? AND blocked = ?)
+            OR
+            (blocker = ? AND blocked = ?)
+        """,
+        (first_id, second_id, second_id, first_id),
+    ).fetchone()
+
+    return row is not None
+
+
+def record_swipe(from_user: int, to_user: int, action: str) -> None:
+    DB.execute(
+        """
+        INSERT INTO swipes (
+            from_user,
+            to_user,
+            action,
+            created
+        )
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(from_user, to_user) DO UPDATE SET
+            action = excluded.action,
+            created = excluded.created
+        """,
+        (from_user, to_user, action, current_time()),
+    )
+    DB.commit()
+
+
+_LINK_RE = re.compile(
+    r"^(?:https?://\S+|www\.\S+|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}(?:/\S*)?)$",
+    re.IGNORECASE,
+)
+
+
+def extract_submission_links(text: str) -> list[str] | None:
+    raw = (text or "").strip()
+
+    if not raw or raw.startswith("/"):
+        return None
+
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+
+    if not lines:
+        return None
+
+    links = []
+
+    for line in lines:
+        if not _LINK_RE.fullmatch(line):
+            return None
+
+        if not line.lower().startswith(("http://", "https://")):
+            line = "https://" + line
+
+        links.append(line)
+
+    return links
+
+
+def add_tiktok_submission(user_id: int, link: str) -> bool:
+    existing = DB.execute(
+        """
+        SELECT 1
+        FROM tiktok_submissions
+        WHERE user_id = ? AND link = ?
+        """,
+        (user_id, link),
+    ).fetchone()
+
+    if existing:
+        return False
+
+    DB.execute(
+        """
+        INSERT INTO tiktok_submissions (
+            user_id,
+            link,
+            created
+        )
+        VALUES (?, ?, ?)
+        """,
+        (user_id, link, current_time()),
+    )
+    DB.commit()
+    return True
+
+
+def log_username_view(
+    admin_id: int,
+    admin_username: str,
+    target_id: int,
+    target_username: str,
+    nickname: str,
+) -> None:
+    DB.execute(
+        """
+        INSERT INTO username_view_logs (
+            admin_id,
+            admin_username,
+            target_id,
+            target_username,
+            profile_nickname,
+            created
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            admin_id,
+            admin_username or None,
+            target_id,
+            target_username or None,
+            nickname or None,
+            current_time(),
+        ),
+    )
+    DB.commit()
 
 
 def delete_profile_completely(user_id: int) -> None:
@@ -659,6 +988,13 @@ def format_db_time(moment: datetime) -> str:
 
 def format_premium_until(moment: datetime) -> str:
     return moment.astimezone(MSK).strftime("%d.%m.%Y, %H:%M МСК")
+
+
+def format_msk(value: str) -> str:
+    try:
+        return format_premium_until(parse_db_time(value))
+    except Exception:
+        return str(value)
 
 
 def premium_db_now() -> str:
@@ -938,6 +1274,128 @@ def add_referral(referred_id: int, referrer_id: int) -> bool:
     return True
 
 
+def add_pending_referral(referred_id: int, referrer_id: int) -> bool:
+    """Реферал ждёт подписки и ещё не идёт в зачёт Premium."""
+    if (
+        referred_id <= 0
+        or referrer_id <= 0
+        or referred_id == referrer_id
+    ):
+        return False
+
+    already = DB.execute(
+        """
+        SELECT 1
+        FROM referrals
+        WHERE referred_id = ?
+        """,
+        (referred_id,),
+    ).fetchone()
+
+    if already:
+        return False
+
+    referrer = DB.execute(
+        """
+        SELECT 1
+        FROM users
+        WHERE user_id = ?
+        """,
+        (referrer_id,),
+    ).fetchone()
+
+    if not referrer:
+        return False
+
+    try:
+        DB.execute(
+            """
+            INSERT INTO pending_referrals (
+                referred_id,
+                referrer_id,
+                created
+            )
+            VALUES (?, ?, ?)
+            ON CONFLICT(referred_id) DO NOTHING
+            """,
+            (
+                referred_id,
+                referrer_id,
+                current_time(),
+            ),
+        )
+        DB.commit()
+    except Exception:
+        DB.rollback()
+        raise
+
+    return True
+
+
+async def maybe_activate_referral(
+    bot: Bot,
+    user_id: int,
+    subscription_ok: bool | None = None,
+) -> None:
+    """
+    Активный реферал — тот, кто подписался на каналы
+    обязательной подписки. Без каналов зачёт сразу.
+    """
+    row = DB.execute(
+        """
+        SELECT referrer_id
+        FROM pending_referrals
+        WHERE referred_id = ?
+        """,
+        (user_id,),
+    ).fetchone()
+
+    if not row:
+        return
+
+    if list_required_channels():
+        if subscription_ok is not True:
+            try:
+                missing = await missing_channels(bot, user_id)
+            except Exception as error:
+                print(
+                    f"Реферал {user_id}: "
+                    f"не удалось проверить подписку: {error}"
+                )
+                return
+
+            if missing:
+                return
+
+    referrer_id = int(row["referrer_id"])
+
+    try:
+        counted = add_referral(user_id, referrer_id)
+    except Exception as error:
+        print(f"Реферал не записан: {error}")
+        return
+
+    try:
+        DB.execute(
+            """
+            DELETE FROM pending_referrals
+            WHERE referred_id = ?
+            """,
+            (user_id,),
+        )
+        DB.commit()
+    except Exception as error:
+        DB.rollback()
+        print(
+            f"Не удалось закрыть ожидание реферала "
+            f"{user_id}: {error}"
+        )
+        return
+
+    if counted:
+        await notify_referrer(bot, referrer_id)
+
+
 async def notify_referrer(bot: Bot, referrer_id: int) -> None:
     until, change = sync_referral_premium(referrer_id)
     progress = referral_progress(referrer_id)
@@ -958,10 +1416,17 @@ async def notify_referrer(bot: Bot, referrer_id: int) -> None:
             "Команда: /prem"
         )
     else:
-        text = (
-            "По вашей ссылке в бота зашёл новый человек.\n"
-            f"Прогресс: {progress} из {REFERRAL_GOAL}."
-        )
+        if list_required_channels():
+            text = (
+                "Приглашённый подписался на каналы "
+                "обязательной подписки.\n"
+                f"Прогресс: {progress} из {REFERRAL_GOAL}."
+            )
+        else:
+            text = (
+                "По вашей ссылке в бота зашёл новый человек.\n"
+                f"Прогресс: {progress} из {REFERRAL_GOAL}."
+            )
 
     try:
         await bot.send_message(
@@ -1016,18 +1481,9 @@ async def attribute_start_referral(event, data: dict) -> None:
         return
 
     try:
-        counted = add_referral(user.id, referrer_id)
+        add_pending_referral(user.id, referrer_id)
     except Exception as error:
         print(f"Реферал не записан: {error}")
-        return
-
-    if not counted:
-        return
-
-    bot = data.get("bot") or getattr(event, "bot", None)
-
-    if bot is not None:
-        await notify_referrer(bot, referrer_id)
 
 
 async def bot_username(bot: Bot) -> str:
@@ -1644,6 +2100,7 @@ ADMIN_STATE_PREFIXES = (
     "BroadcastForm:",
     "ChannelForm:",
     "PremiumAdminForm:",
+    "SuperAdminForm:",
 )
 
 
@@ -1656,6 +2113,10 @@ async def admin_configuration_event(event, data: dict) -> bool:
 
     if isinstance(event, CallbackQuery):
         payload = event.data or ""
+
+        if payload.startswith("super:"):
+            return is_superadmin(user.id)
+
         return payload.startswith((
             "admin:",
             "admin_message:",
@@ -1669,6 +2130,9 @@ async def admin_configuration_event(event, data: dict) -> bool:
 
     if text.startswith("/"):
         command = text.split(maxsplit=1)[0].split("@", 1)[0]
+
+        if command == "/superadmin":
+            return is_superadmin(user.id)
 
         if command in {"/admin", "/cancel"}:
             return True
@@ -1751,26 +2215,51 @@ class GateMiddleware(BaseMiddleware):
 
         user_id = user.id if user is not None else None
 
+        async def activate_referral(
+            subscription_ok: bool | None = None,
+        ) -> None:
+            if user_id is None:
+                return
+
+            bot = data.get("bot") or getattr(event, "bot", None)
+
+            if bot is None:
+                return
+
+            try:
+                await maybe_activate_referral(
+                    bot,
+                    user_id,
+                    subscription_ok=subscription_ok,
+                )
+            except Exception as error:
+                print(f"Реферал не активирован {user_id}: {error}")
+
         if user_id is None or await admin_configuration_event(event, data):
+            await activate_referral()
             return await handler(event, data)
 
         if isinstance(event, CallbackQuery) and (
             event.data or ""
         ).startswith("sub:"):
+            await activate_referral()
             return await handler(event, data)
 
         bot = data.get("bot") or getattr(event, "bot", None)
 
         if bot is None:
+            await activate_referral()
             return await handler(event, data)
 
         try:
             missing = await missing_channels(bot, user_id)
         except Exception as error:
             print(f"Ошибка проверки подписки: {error}")
+            await activate_referral()
             return await handler(event, data)
 
         if not missing:
+            await activate_referral(subscription_ok=True)
             return await handler(event, data)
 
         if isinstance(event, CallbackQuery):
@@ -1819,7 +2308,8 @@ DEFAULT_MESSAGES = {
         "• Поднятие анкеты в топ (ваша анкета будет "
         "отображаться первее остальных)\n\n"
         "В зачёт идут только новые люди, которые впервые "
-        "открыли бота именно по вашей ссылке."
+        "открыли бота по вашей ссылке и подписались "
+        "на каналы обязательной подписки."
     ),
     "tiktok": "тест",
     "reengage": (
@@ -2413,6 +2903,21 @@ async def send_premium_menu(
         lines.append("")
         lines.append(get_message_text("premium"))
 
+    if list_required_channels():
+        lines.append("")
+        lines.append(
+            "Активный реферал — человек, который впервые открыл "
+            "бота по вашей ссылке и подписался на каналы "
+            "обязательной подписки."
+        )
+    else:
+        lines.append("")
+        lines.append(
+            "Активный реферал — человек, который впервые открыл "
+            "бота по вашей ссылке. Если включена обязательная "
+            "подписка, он засчитается только после неё."
+        )
+
     text = "\n".join(lines)
     markup = premium_menu_keyboard(link)
 
@@ -2627,12 +3132,227 @@ callback_data="form_keep:photo_file_id",
     )
 
 
+def bio_keyboard(has_text: bool) -> InlineKeyboardMarkup:
+    buttons = []
+
+    if has_text:
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text="✅ Оставить прежнее",
+                    callback_data="form_keep:bio",
+                )
+            ]
+        )
+
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text="Пропустить",
+                callback_data="form_skip_bio",
+            )
+        ]
+    )
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=buttons,
+    )
+
+
+_ADMIN_LIST_FILTER: dict[int, tuple[str, str]] = {}
+
+
+def remembered_profile_filter(admin_id: int) -> tuple[str, str]:
+    photo_filter, sort = _ADMIN_LIST_FILTER.get(
+        admin_id,
+        ("all", "updated"),
+    )
+
+    if photo_filter not in {"all", "yes", "no"}:
+        photo_filter = "all"
+
+    if sort not in {"updated", "collection"}:
+        sort = "updated"
+
+    return photo_filter, sort
+
+
+def fetch_admin_profiles(
+    photo_filter: str,
+    sort: str,
+    limit: int,
+    offset: int,
+):
+    clauses = []
+    params: list = []
+
+    if photo_filter == "yes":
+        clauses.append(
+            """
+            photo_file_id IS NOT NULL
+            AND TRIM(photo_file_id) != ''
+            AND photo_file_id != ?
+            """
+        )
+        params.append(BLACK_SQUARE_PHOTO)
+    elif photo_filter == "no":
+        clauses.append(
+            """
+            (
+                photo_file_id IS NULL
+                OR TRIM(photo_file_id) = ''
+                OR photo_file_id = ?
+            )
+            """
+        )
+        params.append(BLACK_SQUARE_PHOTO)
+
+    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+    if sort == "collection":
+        order_sql = """
+            ORDER BY
+                CASE
+                    WHEN collection GLOB '[0-9]*'
+                    THEN CAST(collection AS INTEGER)
+                    ELSE -1
+                END DESC,
+                updated DESC
+        """
+    else:
+        order_sql = "ORDER BY updated DESC"
+
+    params.extend([limit, offset])
+
+    return DB.execute(
+        f"""
+        SELECT user_id, nickname, active, collection
+        FROM profiles
+        {where_sql}
+        {order_sql}
+        LIMIT ? OFFSET ?
+        """,
+        params,
+    ).fetchall()
+
+
+def admin_profiles_markup(
+    profiles,
+    page: int,
+    photo_filter: str,
+    sort: str,
+    has_next: bool,
+) -> InlineKeyboardMarkup:
+    def marked(active: bool, label: str) -> str:
+        return f"✅ {label}" if active else label
+
+    def profiles_callback(next_page: int, photo: str, next_sort: str) -> str:
+        return f"admin:profiles:{next_page}:{photo}:{next_sort}"
+
+    buttons = [
+        [
+            InlineKeyboardButton(
+                text=marked(photo_filter == "all", "Все"),
+                callback_data=profiles_callback(0, "all", sort),
+            ),
+            InlineKeyboardButton(
+                text=marked(photo_filter == "yes", "С фото"),
+                callback_data=profiles_callback(0, "yes", sort),
+            ),
+            InlineKeyboardButton(
+                text=marked(photo_filter == "no", "Без фото"),
+                callback_data=profiles_callback(0, "no", sort),
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text=marked(sort == "updated", "Сначала новые"),
+                callback_data=profiles_callback(0, photo_filter, "updated"),
+            ),
+            InlineKeyboardButton(
+                text=marked(sort == "collection", "Коллекция ↓"),
+                callback_data=profiles_callback(0, photo_filter, "collection"),
+            ),
+        ],
+    ]
+
+    for profile in profiles:
+        status = "🟢" if profile["active"] else "⚪️"
+        collection = str(profile["collection"] or "").strip()
+        collection_bit = f" · {collection}" if collection else ""
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text=(
+                        f"{status} "
+                        f"{profile['nickname']}"
+                        f"{collection_bit}"
+                    )[:64],
+                    callback_data=f"admin:user:{profile['user_id']}",
+                )
+            ]
+        )
+
+    navigation = []
+
+    if page > 0:
+        navigation.append(
+            InlineKeyboardButton(
+                text="⬅️ Назад",
+                callback_data=profiles_callback(
+                    page - 1,
+                    photo_filter,
+                    sort,
+                ),
+            )
+        )
+
+    if has_next:
+        navigation.append(
+            InlineKeyboardButton(
+                text="➡️ Далее",
+                callback_data=profiles_callback(
+                    page + 1,
+                    photo_filter,
+                    sort,
+                ),
+            )
+        )
+
+    if navigation:
+        buttons.append(navigation)
+
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text="🏠 В меню",
+                callback_data="admin:menu",
+            )
+        ]
+    )
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
 def admin_profile_keyboard(
     user_id: int,
     active: bool,
+    viewer_id: int | None = None,
 ) -> InlineKeyboardMarkup:
+    photo_filter, sort = (
+        remembered_profile_filter(viewer_id)
+        if viewer_id is not None
+        else ("all", "updated")
+    )
+
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Узнать юзернейм",
+                    callback_data=f"admin:username:{user_id}",
+                ),
+            ],
             [
                 InlineKeyboardButton(
                     text=(
@@ -2654,7 +3374,9 @@ def admin_profile_keyboard(
             [
                 InlineKeyboardButton(
                     text="⬅️ К списку",
-                    callback_data="admin:profiles:0",
+                    callback_data=(
+                        f"admin:profiles:0:{photo_filter}:{sort}"
+                    ),
                 ),
             ],
         ]
@@ -2700,31 +3422,103 @@ def admin_messages_keyboard() -> InlineKeyboardMarkup:
 # ФОРМАТИРОВАНИЕ АНКЕТЫ
 # ============================================================
 
-def profile_text(profile) -> str:
+CONTACT_LOCKED_NOTE = "ID и TG будут доступны после взаимного лайка"
+ADMIN_HIDDEN_NOTE = (
+    "PUBG ID, юзернейм и Telegram ID скрыты. "
+    "Их открывает кнопка «Узнать юзернейм»."
+)
+
+
+def has_mutual_like(first_id: int, second_id: int) -> bool:
+    if first_id == second_id:
+        return False
+
+    rows = DB.execute(
+        """
+        SELECT from_user
+        FROM swipes
+        WHERE action = 'like'
+          AND (
+              (from_user = ? AND to_user = ?)
+              OR (from_user = ? AND to_user = ?)
+          )
+        """,
+        (first_id, second_id, second_id, first_id),
+    ).fetchall()
+    sides = {int(row["from_user"]) for row in rows}
+    return first_id in sides and second_id in sides
+
+
+def profile_text(
+    profile,
+    reveal_contacts: bool = True,
+    contact_note: str | None = None,
+) -> str:
     gender = profile["gender"] or "Не указан"
     age = profile["age"] or "Не указан"
 
-    return (
+    try:
+        collection = profile["collection"]
+    except (KeyError, IndexError):
+        collection = None
+
+    collection_text = (
+        str(collection).strip() if collection else ""
+    ) or "Не указан"
+
+    try:
+        bio = str(profile["bio"] or "").strip()
+    except (KeyError, IndexError):
+        bio = ""
+
+    if reveal_contacts:
+        pubg_id_text = f"<code>{profile['pubg_id']}</code>"
+        note = ""
+    else:
+        pubg_id_text = "скрыто"
+        if contact_note is None:
+            note = f"\n\n{CONTACT_LOCKED_NOTE}"
+        elif contact_note:
+            note = f"\n\n{contact_note}"
+        else:
+            note = ""
+
+    limit = 4000 - len(note)
+    text = (
         f"🎮 <b>{profile['nickname']}</b>\n\n"
         f"🚻 Пол: {gender}\n"
         f"🎂 Возраст: {age}\n"
-        f"🆔 PUBG ID: <code>{profile['pubg_id']}</code>\n"
+        f"🆔 PUBG ID: {pubg_id_text}\n"
         f"🌍 Сервер: {profile['server']}\n"
         f"🎯 Режим: {profile['mode']}\n"
         f"🏆 Ранг: {profile['rank']}\n"
+        f"📦 Уровень коллекции: {collection_text}\n"
         f"🎙 Микрофон: {profile['voice']}\n"
         f"🕒 Время игры: {profile['schedule']}\n"
-        f"💬 Язык: {profile['language']}\n\n"
-        f"📝 {profile['bio']}"
+        f"💬 Язык: {profile['language']}"
     )
+
+    if bio:
+        suffix = f"\n\n📝 {bio}"
+
+        if len(text) + len(suffix) <= limit:
+            text += suffix
+        else:
+            room = max(0, limit - len(text) - 2)
+
+            if room:
+                text += f"\n\n📝 {bio[:room]}"
+
+    return text + note
 
 
 async def send_profile(
     message: Message,
     profile,
     reply_markup=None,
+    reveal_contacts: bool = True,
 ) -> None:
-    text = profile_text(profile)
+    text = profile_text(profile, reveal_contacts=reveal_contacts)
     photo = profile_photo_source(profile["photo_file_id"])
 
     if photo and len(text) <= 1024:
@@ -2757,6 +3551,73 @@ async def send_profile(
         message,
         text,
         reply_markup,
+    )
+
+
+async def deliver_profile(
+    bot: Bot,
+    chat_id: int,
+    profile,
+    reply_markup=None,
+    prefix: str = "",
+    reveal_contacts: bool = True,
+) -> None:
+    body = profile_text(profile, reveal_contacts=reveal_contacts)
+    text = f"{prefix}\n\n{body}" if prefix else body
+    photo = profile_photo_source(profile["photo_file_id"])
+
+    if photo and len(text) <= 1024:
+        try:
+            await bot.send_photo(
+                chat_id,
+                photo=photo,
+                caption=text,
+                reply_markup=reply_markup,
+            )
+            return
+        except Exception as error:
+            print(
+                f"Не удалось отправить фото анкеты "
+                f"{profile['user_id']} в {chat_id}: {error}"
+            )
+
+    if photo:
+        try:
+            await bot.send_photo(
+                chat_id,
+                photo=profile_photo_source(profile["photo_file_id"]),
+            )
+        except Exception as error:
+            print(
+                f"Фото анкеты {profile['user_id']} "
+                f"недоступно для {chat_id}: {error}"
+            )
+            text += "\n\n⚠️ Фото анкеты недоступно."
+
+    if len(text) > 4096:
+        text = text[:4095] + "…"
+
+    await bot.send_message(
+        chat_id,
+        text,
+        reply_markup=reply_markup,
+    )
+
+
+def likeback_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="❤️ Лайкнуть в ответ",
+                    callback_data=f"likeback:like:{user_id}",
+                ),
+                InlineKeyboardButton(
+                    text="Пропустить",
+                    callback_data=f"likeback:skip:{user_id}",
+                ),
+            ]
+        ]
     )
 
 
@@ -2818,10 +3679,10 @@ def form_prompt(
 
         return text
 
-    if field_name == "bio":
+    if field_name == "collection":
         text = (
-            "Расскажите о себе.\n"
-            f"Минимум {BIO_MIN_LENGTH} символов."
+            "Введите уровень коллекции.\n"
+            f"Число от {COLLECTION_MIN} до {COLLECTION_MAX}."
         )
 
         if old_value:
@@ -2830,6 +3691,18 @@ def form_prompt(
                 "Если хотите оставить прежнее значение, "
                 "используйте соответствующую кнопку."
             )
+
+        return text
+
+    if field_name == "bio":
+        text = (
+            "Расскажите о себе.\n"
+            "Можно написать текст любой длины "
+            "или нажать «Пропустить»."
+        )
+
+        if old_value:
+            text += f"\n\nТекущее значение: {old_value}"
 
         return text
 
@@ -2884,6 +3757,15 @@ async def ask_field(
         await message.answer(
             form_prompt(field_name, old_value),
             reply_markup=gender_keyboard(),
+        )
+        return
+
+    if field_name == "bio":
+        await message.answer(
+            form_prompt(field_name, old_value),
+            reply_markup=bio_keyboard(
+                bool(str(old_value or "").strip())
+            ),
         )
         return
 
@@ -3027,10 +3909,10 @@ def save_profile(
         "server",
         "mode",
         "rank",
+        "collection",
         "voice",
         "schedule",
         "language",
-        "bio",
     ]
 
     for field in required:
@@ -3046,13 +3928,7 @@ def save_profile(
             "PUBG ID должен содержать минимум 5 цифр."
         )
 
-    bio = str(values["bio"]).strip()
-
-    if len(bio) < BIO_MIN_LENGTH:
-        raise ValueError(
-            f"Поле «О себе» должно содержать минимум "
-            f"{BIO_MIN_LENGTH} символов."
-        )
+    bio = str(values.get("bio") or "").strip()
 
     gender = normalize_gender(str(values["gender"]))
 
@@ -3068,6 +3944,14 @@ def save_profile(
             f"Возраст нужно указать числом от {AGE_MIN} до {AGE_MAX}."
         )
 
+    collection = normalize_collection(str(values.get("collection", "")))
+
+    if collection is None:
+        raise ValueError(
+            "Уровень коллекции нужно указать числом "
+            f"от {COLLECTION_MIN} до {COLLECTION_MAX}."
+        )
+
     DB.execute(
         """
         INSERT INTO profiles (
@@ -3079,6 +3963,7 @@ def save_profile(
             server,
             mode,
             rank,
+            collection,
             voice,
             schedule,
             language,
@@ -3087,7 +3972,7 @@ def save_profile(
             active,
             updated
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
         ON CONFLICT(user_id) DO UPDATE SET
             nickname = excluded.nickname,
             gender = excluded.gender,
@@ -3096,6 +3981,7 @@ def save_profile(
             server = excluded.server,
             mode = excluded.mode,
             rank = excluded.rank,
+            collection = excluded.collection,
             voice = excluded.voice,
             schedule = excluded.schedule,
             language = excluded.language,
@@ -3113,6 +3999,7 @@ def save_profile(
             str(values["server"]).strip(),
             str(values["mode"]).strip(),
             str(values["rank"]).strip(),
+            collection,
             str(values["voice"]).strip(),
             str(values["schedule"]).strip(),
             str(values["language"]).strip(),
@@ -3218,6 +4105,22 @@ async def command_admin(message: Message):
     )
 
 
+@router.message(Command("superadmin"))
+async def command_superadmin(
+    message: Message,
+    state: FSMContext,
+):
+    if not is_superadmin(message.from_user.id):
+        await message.answer("⛔️ Нет доступа.")
+        return
+
+    await state.clear()
+    await message.answer(
+        "Панель супер-админа:",
+        reply_markup=superadmin_keyboard(),
+    )
+
+
 @router.message(F.text == "📝 Моя анкета")
 async def menu_profile(message: Message):
     await command_profile(message)
@@ -3236,12 +4139,25 @@ async def menu_prem(message: Message, bot: Bot):
     await command_prem(message, bot)
 
 
+def tiktok_submit_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Отправить тикток на выплату",
+                    callback_data="tiktok:submit",
+                )
+            ]
+        ]
+    )
+
+
 @router.message(F.text == "Заработай на тик-токах")
 async def menu_tiktok(message: Message):
     await send_template(
         message,
         "tiktok",
-        keyboard_for(message.from_user.id),
+        tiktok_submit_keyboard(),
     )
 
 
@@ -3369,16 +4285,16 @@ async def form_keep(
         )
         return
 
-    if field_name == "bio":
+    if field_name == "collection":
         data = await state.get_data()
-        bio = str(
-            data.get("values", {}).get("bio") or ""
-        ).strip()
+        collection = str(
+            data.get("values", {}).get("collection") or ""
+        )
 
-        if len(bio) < BIO_MIN_LENGTH:
+        if normalize_collection(collection) is None:
             await callback.answer(
-                f"В поле «О себе» нужно минимум "
-                f"{BIO_MIN_LENGTH} символов.",
+                "Уровень коллекции — число "
+                f"от {COLLECTION_MIN} до {COLLECTION_MAX}.",
                 show_alert=True,
             )
             return
@@ -3437,6 +4353,35 @@ async def form_skip_photo(
             callback.message,
             state,
             "photo_file_id",
+        )
+
+
+@router.callback_query(F.data == "form_skip_bio")
+async def form_skip_bio(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
+    current_state = await state.get_state()
+
+    if not current_state or not current_state.endswith("bio"):
+        await callback.answer(
+            "Это поле уже обработано.",
+            show_alert=True,
+        )
+        return
+
+    data = await state.get_data()
+    values = data.get("values", {})
+    values["bio"] = ""
+
+    await state.update_data(values=values)
+    await callback.answer("Поле «О себе» пропущено.")
+
+    if callback.message:
+        await next_field(
+            callback.message,
+            state,
+            "bio",
         )
 
 
@@ -3712,6 +4657,52 @@ async def profile_age_invalid(message: Message):
 
 @router.message(
     StateFilter(
+        ProfileForm.collection,
+        AdminProfileForm.collection,
+    ),
+    F.text,
+)
+async def profile_collection(
+    message: Message,
+    state: FSMContext,
+):
+    collection = normalize_collection(message.text)
+
+    if collection is None:
+        await message.answer(
+            "Уровень коллекции нужно указать числом "
+            f"от {COLLECTION_MIN} до {COLLECTION_MAX}."
+        )
+        return
+
+    data = await state.get_data()
+    values = data.get("values", {})
+    values["collection"] = collection
+
+    await state.update_data(values=values)
+
+    await next_field(
+        message,
+        state,
+        "collection",
+    )
+
+
+@router.message(
+    StateFilter(
+        ProfileForm.collection,
+        AdminProfileForm.collection,
+    ),
+)
+async def profile_collection_invalid(message: Message):
+    await message.answer(
+        "Уровень коллекции нужно указать числом "
+        f"от {COLLECTION_MIN} до {COLLECTION_MAX}."
+    )
+
+
+@router.message(
+    StateFilter(
         ProfileForm.pubg_id,
         AdminProfileForm.pubg_id,
     ),
@@ -3766,21 +4757,22 @@ async def profile_text_field(
     value = message.text.strip()
 
     if not value:
+        if field_name == "bio":
+            await message.answer(
+                "Напишите текст или нажмите «Пропустить».",
+                reply_markup=bio_keyboard(False),
+            )
+            return
+
         await message.answer(
             "Значение не должно быть пустым."
         )
         return
 
-    if field_name == "bio" and len(value) < BIO_MIN_LENGTH:
-        await message.answer(
-            f"Поле «О себе» должно содержать минимум "
-            f"{BIO_MIN_LENGTH} символов."
-        )
-        return
-
     data = await state.get_data()
     values = data.get("values", {})
-    values[field_name] = value[:2000]
+    limit = 4000 if field_name == "bio" else 2000
+    values[field_name] = value[:limit]
 
     await state.update_data(values=values)
 
@@ -3832,6 +4824,74 @@ async def profile_photo_invalid(message: Message):
 # ============================================================
 # ПОИСК
 # ============================================================
+
+VIEW_DAILY_LIMIT = 25
+VIEW_LIMIT_TEXT = (
+    "Вы превысили суточный лимит просмотра анкет 25/25. "
+    "Чтобы увеличить лимит нужен Premium, его можно получить бесплатно "
+    "за приглашение людей в бота. Также в Premium открываются функции "
+    "\"Поиск по полу\" и \"Поднятие анкеты в топ\". "
+    "Получить премиум - /prem"
+)
+
+
+def msk_day() -> str:
+    return datetime.now(MSK).strftime("%Y-%m-%d")
+
+
+def views_used_today(user_id: int) -> int:
+    row = DB.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM daily_views
+        WHERE user_id = ? AND day = ?
+        """,
+        (user_id, msk_day()),
+    ).fetchone()
+    return int(row["count"]) if row else 0
+
+
+def profile_seen_today(user_id: int, target_id: int) -> bool:
+    row = DB.execute(
+        """
+        SELECT 1
+        FROM daily_views
+        WHERE user_id = ? AND target_id = ? AND day = ?
+        """,
+        (user_id, target_id, msk_day()),
+    ).fetchone()
+    return row is not None
+
+
+def consume_profile_view(user_id: int, target_id: int) -> None:
+    if has_premium(user_id):
+        return
+
+    try:
+        DB.execute(
+            """
+            INSERT INTO daily_views (
+                user_id,
+                target_id,
+                day
+            )
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id, target_id, day) DO NOTHING
+            """,
+            (user_id, target_id, msk_day()),
+        )
+        DB.commit()
+    except Exception:
+        DB.rollback()
+        raise
+
+
+async def answer_view_limit(message: Message, user_id: int) -> None:
+    await message.answer(
+        VIEW_LIMIT_TEXT,
+        reply_markup=keyboard_for(user_id),
+    )
+
 
 async def search_next(
     message: Message,
@@ -3910,10 +4970,20 @@ async def search_next(
         )
         return
 
+    target_id = int(profile["user_id"])
+
+    if not has_premium(user_id) and not profile_seen_today(user_id, target_id):
+        if views_used_today(user_id) >= VIEW_DAILY_LIMIT:
+            await answer_view_limit(message, user_id)
+            return
+
+        consume_profile_view(user_id, target_id)
+
     await send_profile(
         message,
         profile,
-        profile_actions_keyboard(profile["user_id"]),
+        profile_actions_keyboard(target_id),
+        reveal_contacts=has_mutual_like(user_id, target_id),
     )
 
 
@@ -3999,6 +5069,36 @@ async def premium_boost(callback: CallbackQuery):
         await callback.message.answer(text)
 
 
+async def notify_incoming_like(
+    bot: Bot,
+    liker_id: int,
+    liked_id: int,
+) -> None:
+    if liker_id == liked_id or users_blocked(liker_id, liked_id):
+        return
+
+    liker = get_profile(liker_id)
+
+    if not liker or not int(liker["active"] or 0):
+        return
+
+    try:
+        await deliver_profile(
+            bot,
+            liked_id,
+            liker,
+            reply_markup=likeback_keyboard(liker_id),
+            prefix=(
+                "❤️ Вашу анкету лайкнули.\n"
+                "Ниже анкета человека, которому вы понравились. "
+                "Можно лайкнуть в ответ или пропустить."
+            ),
+            reveal_contacts=has_mutual_like(liked_id, liker_id),
+        )
+    except Exception as error:
+        print(f"Не удалось сообщить о лайке {liked_id}: {error}")
+
+
 async def notify_match(
     bot: Bot,
     first_id: int,
@@ -4046,6 +5146,113 @@ async def notify_match(
                 f"Не удалось отправить уведомление "
                 f"{user_id}: {error}"
             )
+
+
+@router.callback_query(F.data.startswith("likeback:"))
+async def process_likeback(
+    callback: CallbackQuery,
+    bot: Bot,
+):
+    parts = (callback.data or "").split(":")
+
+    if len(parts) != 3 or parts[1] not in {"like", "skip"}:
+        await callback.answer(
+            "Неизвестное действие.",
+            show_alert=True,
+        )
+        return
+
+    if not parts[2].isdigit():
+        await callback.answer(
+            "Анкета не найдена.",
+            show_alert=True,
+        )
+        return
+
+    action = parts[1]
+    liker_id = int(parts[2])
+    user_id = callback.from_user.id
+
+    if liker_id == user_id:
+        await callback.answer(
+            "Нельзя лайкнуть свою анкету.",
+            show_alert=True,
+        )
+        return
+
+    existing = DB.execute(
+        """
+        SELECT action
+        FROM swipes
+        WHERE from_user = ? AND to_user = ?
+        """,
+        (user_id, liker_id),
+    ).fetchone()
+
+    if existing and existing["action"] == (
+        "like" if action == "like" else "skip"
+    ):
+        await callback.answer("Этот ответ уже выбран.")
+        return
+
+    if action == "like":
+        if not get_profile(user_id):
+            await callback.answer(
+                "Сначала создайте свою анкету, чтобы ответить на лайк.",
+                show_alert=True,
+            )
+            return
+
+        liker = get_profile(liker_id)
+
+        if not liker or not int(liker["active"] or 0):
+            await callback.answer(
+                "Анкета уже недоступна.",
+                show_alert=True,
+            )
+            return
+
+        record_swipe(user_id, liker_id, "like")
+        mutual = DB.execute(
+            """
+            SELECT 1
+            FROM swipes
+            WHERE from_user = ?
+              AND to_user = ?
+              AND action = 'like'
+            """,
+            (liker_id, user_id),
+        ).fetchone()
+
+        if mutual:
+            await callback.answer(
+                "🎉 Взаимный лайк!",
+                show_alert=True,
+            )
+            await notify_match(bot, user_id, liker_id)
+        else:
+            await callback.answer("Лайк отправлен.")
+            await notify_incoming_like(bot, user_id, liker_id)
+    else:
+        record_swipe(user_id, liker_id, "skip")
+        await callback.answer("Анкета пропущена.")
+
+    if callback.message:
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception as error:
+            print(f"Не удалось убрать кнопки ответа на лайк: {error}")
+
+        if action == "skip":
+            await callback.message.answer("Вы пропустили эту анкету.")
+        elif not existing or existing["action"] != "like":
+            await callback.message.answer(
+                "Ответ сохранён."
+                if action == "skip"
+                else "Вы лайкнули в ответ."
+            )
+
+
 @router.callback_query(F.data.startswith("swipe:"))
 async def process_swipe(
     callback: CallbackQuery,
@@ -4156,6 +5363,11 @@ async def process_swipe(
             await callback.answer(
                 "Лайк отправлен."
             )
+            await notify_incoming_like(
+                bot,
+                user_id,
+                target_id,
+            )
     else:
         await callback.answer(
             "Анкета пропущена."
@@ -4216,99 +5428,68 @@ async def admin_callback(
         return
 
     if action == "profiles":
-        page = int(parts[2])
+        page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+        photo_filter = (
+            parts[3]
+            if len(parts) > 3 and parts[3] in {"all", "yes", "no"}
+            else "all"
+        )
+        sort = (
+            parts[4]
+            if len(parts) > 4 and parts[4] in {"updated", "collection"}
+            else "updated"
+        )
         limit = 10
-        offset = page * limit
+        _ADMIN_LIST_FILTER[callback.from_user.id] = (photo_filter, sort)
+        profiles = fetch_admin_profiles(
+            photo_filter,
+            sort,
+            limit + 1,
+            page * limit,
+        )
+        has_next = len(profiles) > limit
+        profiles = profiles[:limit]
 
-        profiles = DB.execute(
-            """
-            SELECT user_id, nickname, server, mode, active
-            FROM profiles
-            ORDER BY updated DESC
-            LIMIT ? OFFSET ?
-            """,
-            (
-                limit,
-                offset,
-            ),
-        ).fetchall()
-        if not profiles:
-            if page == 0 and callback.message:
-                await callback.answer()
-                await edit_or_send(
-                    callback.message,
-                    "Анкет пока нет.",
-                    reply_markup=admin_keyboard(),
-                )
-            else:
-                await callback.answer(
-                    "Анкет больше нет.",
-                    show_alert=True,
-                )
+        if not profiles and page > 0:
+            await callback.answer(
+                "Анкет больше нет.",
+                show_alert=True,
+            )
             return
 
-        buttons = []
+        if sort == "collection":
+            sort_line = "Сортировка: уровень коллекции, от большего к меньшему."
+        else:
+            sort_line = "Сортировка: сначала новые."
 
-        for profile in profiles:
-            status = "🟢" if profile["active"] else "⚪️"
+        if photo_filter == "yes":
+            photo_line = "Фото: только с фото."
+        elif photo_filter == "no":
+            photo_line = "Фото: только без фото."
+        else:
+            photo_line = "Фото: все анкеты."
 
-            buttons.append(
-                [
-                    InlineKeyboardButton(
-                        text=(
-                            f"{status} "
-                            f"{profile['nickname']} "
-                            f"— {profile['user_id']}"
-                        )[:64],
-                        callback_data=(
-                            f"admin:user:{profile['user_id']}"
-                        ),
-                    )
-                ]
-            )
-
-        navigation = []
-
-        if page > 0:
-            navigation.append(
-                InlineKeyboardButton(
-                    text="⬅️ Назад",
-                    callback_data=(
-                        f"admin:profiles:{page - 1}"
-                    ),
-                )
-            )
-
-        if len(profiles) == limit:
-            navigation.append(
-                InlineKeyboardButton(
-                    text="➡️ Далее",
-                    callback_data=(
-                        f"admin:profiles:{page + 1}"
-                    ),
-                )
-            )
-
-        if navigation:
-            buttons.append(navigation)
-
-        buttons.append(
-            [
-                InlineKeyboardButton(
-                    text="🏠 В меню",
-                    callback_data="admin:menu",
-                )
-            ]
+        text = (
+            f"<b>Анкеты</b> — страница {page + 1}\n"
+            f"{photo_line}\n"
+            f"{sort_line}"
         )
+
+        if not profiles:
+            text += "\n\nПо этому фильтру анкет нет."
 
         await callback.answer()
 
         if callback.message:
             await edit_or_send(
                 callback.message,
-                f"Анкеты — страница {page + 1}:",
-                reply_markup=InlineKeyboardMarkup(
-                    inline_keyboard=buttons,
+                text,
+                reply_markup=admin_profiles_markup(
+                    profiles,
+                    page,
+                    photo_filter,
+                    sort,
+                    has_next,
                 ),
             )
 
@@ -4326,8 +5507,7 @@ async def admin_callback(
             return
 
         text = (
-            f"{profile_text(profile)}\n\n"
-            f"Telegram ID: <code>{user_id}</code>\n"
+            f"{profile_text(profile, reveal_contacts=False, contact_note=ADMIN_HIDDEN_NOTE)}\n\n"
             f"Показ: "
             f"{'включён' if profile['active'] else 'выключен'}\n"
             f"Premium: {'да' if has_premium(user_id) else 'нет'}\n"
@@ -4341,29 +5521,102 @@ async def admin_callback(
             keyboard = admin_profile_keyboard(
                 user_id,
                 bool(profile["active"]),
+                callback.from_user.id,
             )
 
-            # Кнопки всегда на текстовом сообщении.
-            # На фото edit_text недоступен, из-за этого
-            # «Удалить анкету» ничего не делало.
-            photo_shown = False
-
-            if photo:
+            # Карточка как у игрока: фото и все поля, кроме скрытых.
+            # Кнопки на фото; удаление идёт через edit_or_send, он умеет медиа.
+            if photo and len(text) <= 1024:
                 try:
                     await callback.message.answer_photo(
                         photo=photo,
-                        caption=text if len(text) <= 1024 else None,
+                        caption=text,
+                        reply_markup=keyboard,
                     )
-                    photo_shown = True
+                    return
+                except Exception as error:
+                    print(f"Фото анкеты {user_id}: {error}")
+                    text += "\n\n⚠️ Фото анкеты недоступно."
+            elif photo:
+                try:
+                    await callback.message.answer_photo(
+                        photo=profile_photo_source(profile["photo_file_id"]),
+                    )
                 except Exception as error:
                     print(f"Фото анкеты {user_id}: {error}")
                     text += "\n\n⚠️ Фото анкеты недоступно."
 
-            show_full_text = (not photo_shown) or len(text) > 1024
-
             await callback.message.answer(
-                text if show_full_text else "Управление анкетой:",
+                text,
                 reply_markup=keyboard,
+            )
+
+        return
+
+    if action == "username":
+        if len(parts) < 3 or not parts[2].isdigit():
+            await callback.answer(
+                "Анкета не найдена.",
+                show_alert=True,
+            )
+            return
+
+        target_id = int(parts[2])
+        profile = get_profile(target_id)
+
+        if not profile:
+            await callback.answer(
+                "Анкета не найдена.",
+                show_alert=True,
+            )
+            return
+
+        admin_id = callback.from_user.id
+        admin_username = (
+            stored_username(admin_id)
+            or (callback.from_user.username or "")
+        )
+        target_username = stored_username(target_id)
+        nickname = str(profile["nickname"] or "")
+
+        try:
+            log_username_view(
+                admin_id,
+                admin_username,
+                target_id,
+                target_username,
+                nickname,
+            )
+        except Exception as error:
+            DB.rollback()
+            print(f"Лог юзернейма {target_id}: {error}")
+            await callback.answer(
+                "Не удалось открыть юзернейм.",
+                show_alert=True,
+            )
+            return
+
+        await callback.answer()
+
+        if target_username:
+            shown = "@" + html.escape(target_username)
+        else:
+            shown = "не задан"
+
+        pubg_raw = str(profile["pubg_id"] or "").strip()
+        pubg_shown = (
+            f"<code>{html.escape(pubg_raw)}</code>"
+            if pubg_raw
+            else "не указан"
+        )
+
+        if callback.message:
+            await callback.message.answer(
+                "<b>Скрытые данные анкеты</b>\n"
+                f"Анкета: {html.escape(nickname)}\n"
+                f"Username: {shown}\n"
+                f"Telegram ID: <code>{target_id}</code>\n"
+                f"PUBG ID: {pubg_shown}"
             )
 
         return
@@ -4405,6 +5658,7 @@ async def admin_callback(
                     reply_markup=admin_profile_keyboard(
                         user_id,
                         bool(new_active),
+                        callback.from_user.id,
                     )
                 )
             except Exception as error:
@@ -4414,6 +5668,7 @@ async def admin_callback(
                     reply_markup=admin_profile_keyboard(
                         user_id,
                         bool(new_active),
+                        callback.from_user.id,
                     ),
                 )
 
@@ -4421,8 +5676,9 @@ async def admin_callback(
 
     if action == "delete_confirm":
         user_id = int(parts[2])
+        profile = get_profile(user_id)
 
-        if not get_profile(user_id):
+        if not profile:
             await callback.answer(
                 "Анкета не найдена.",
                 show_alert=True,
@@ -4432,10 +5688,11 @@ async def admin_callback(
         await callback.answer()
 
         if callback.message:
+            nickname = html.escape(str(profile["nickname"] or "анкета"))
             await edit_or_send(
                 callback.message,
-                f"Удалить анкету пользователя "
-                f"<code>{user_id}</code>?",
+                f"Удалить анкету «{nickname}» "
+                f"(<code>{user_id}</code>)?",
                 reply_markup=delete_confirmation_keyboard(
                     user_id,
                     admin=True,
@@ -4446,13 +5703,16 @@ async def admin_callback(
 
     if action == "delete":
         user_id = int(parts[2])
+        profile = get_profile(user_id)
 
-        if not get_profile(user_id):
+        if not profile:
             await callback.answer(
                 "Анкета уже удалена.",
                 show_alert=True,
             )
             return
+
+        nickname = html.escape(str(profile["nickname"] or "анкета"))
 
         try:
             delete_profile_completely(user_id)
@@ -4476,8 +5736,8 @@ async def admin_callback(
         if callback.message:
             await edit_or_send(
                 callback.message,
-                f"✅ Анкета пользователя "
-                f"<code>{user_id}</code> удалена.",
+                f"✅ Анкета «{nickname}» "
+                f"(<code>{user_id}</code>) удалена.",
                 reply_markup=admin_keyboard(),
             )
 
@@ -4619,9 +5879,22 @@ async def admin_callback(
         )
 
         if profile:
-            text += f"\n\n{profile_text(profile)}"
+            text += (
+                "\n\n"
+                + profile_text(
+                    profile,
+                    reveal_contacts=False,
+                    contact_note="",
+                )
+            )
 
         buttons = [
+            [
+                InlineKeyboardButton(
+                    text="Узнать юзернейм",
+                    callback_data=f"admin:username:{report['reported']}",
+                ),
+            ],
             [
                 InlineKeyboardButton(
                     text="🗑 Удалить анкету",
@@ -5620,6 +6893,895 @@ async def admin_channel_links(
 # ============================================================
 # ЗАПУСК
 # ============================================================
+
+def superadmin_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Назначить админа",
+                    callback_data="super:add",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Снять админа",
+                    callback_data="super:remove",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Логи",
+                    callback_data="super:logs:0",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Тиктоки",
+                    callback_data="super:tiktoks:0",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Админ-панель",
+                    callback_data="admin:menu",
+                )
+            ],
+        ]
+    )
+
+
+def person_label(user_id: int) -> str:
+    username = stored_username(user_id)
+    profile = get_profile(user_id)
+    nickname = ""
+
+    if profile and profile["nickname"]:
+        nickname = str(profile["nickname"])
+
+    if username and nickname:
+        return f"{nickname} · @{username}"
+
+    if username:
+        return f"@{username}"
+
+    if nickname:
+        return f"{nickname} · id {user_id}"
+
+    return f"id {user_id}"
+
+
+def resolve_admin_query(text: str) -> list[int] | None:
+    raw = (text or "").strip()
+
+    if not raw or raw.startswith("/"):
+        return None
+
+    if raw.isdigit():
+        user_id = int(raw)
+        return [user_id] if user_id > 0 else []
+
+    username = raw[1:] if raw.startswith("@") else raw
+
+    if not re.fullmatch(r"[A-Za-z0-9_]{4,}", username):
+        return []
+
+    rows = DB.execute(
+        """
+        SELECT user_id
+        FROM users
+        WHERE username = ? COLLATE NOCASE
+        """,
+        (username,),
+    ).fetchall()
+
+    return [int(row["user_id"]) for row in rows]
+
+
+def removable_admin_ids() -> list[int]:
+    found: list[int] = []
+    seen: set[int] = set()
+
+    def add(user_id: int) -> None:
+        user_id = int(user_id)
+
+        if user_id <= 0 or user_id in seen or user_id in SUPERADMIN_IDS:
+            return
+
+        seen.add(user_id)
+        found.append(user_id)
+
+    for user_id in sorted(ADMIN_IDS):
+        if is_env_admin_revoked(user_id):
+            continue
+
+        add(user_id)
+
+    rows = DB.execute(
+        """
+        SELECT user_id
+        FROM admins
+        ORDER BY created DESC, user_id
+        """
+    ).fetchall()
+
+    for row in rows:
+        add(int(row["user_id"]))
+
+    return found
+
+
+def admin_remove_label(user_id: int) -> str:
+    label = person_label(user_id)
+    marks = []
+
+    if user_id in ADMIN_IDS and not is_env_admin_revoked(user_id):
+        marks.append("ADMIN_IDS")
+
+    if is_db_admin(user_id):
+        marks.append("назначен")
+
+    if marks:
+        label = f"{label} · {', '.join(marks)}"
+
+    return label[:64]
+
+
+async def notify_admin_role(
+    bot: Bot,
+    user_id: int,
+    enabled: bool,
+) -> None:
+    if enabled:
+        text = (
+            "Вам выдали права администратора.\n"
+            "Команда: /admin"
+        )
+    else:
+        text = "Права администратора сняты."
+
+    try:
+        await bot.send_message(user_id, text)
+    except Exception as error:
+        print(f"Не удалось сообщить о роли {user_id}: {error}")
+
+
+async def appoint_admin_user(
+    bot: Bot,
+    actor_id: int,
+    target_id: int,
+) -> str:
+    if target_id <= 0:
+        return "Некорректный Telegram ID."
+
+    if (
+        is_superadmin(target_id)
+        or (
+            target_id in ADMIN_IDS
+            and not is_env_admin_revoked(target_id)
+        )
+    ):
+        return "Этот человек уже администратор из настроек запуска."
+
+    if is_db_admin(target_id):
+        return "Этот человек уже назначен админом."
+
+    grant_admin(target_id, actor_id)
+    await notify_admin_role(bot, target_id, True)
+    known = get_user_row(target_id)
+    extra = ""
+
+    if not known:
+        extra = (
+            "\nЧеловек ещё не открывал бота. "
+            "Права заработают, когда он запустит его."
+        )
+
+    return f"Админ назначен: {html.escape(person_label(target_id))}.{extra}"
+
+
+def username_log_label(row) -> str:
+    when = format_msk(row["created"])
+    admin_name = (
+        f"@{row['admin_username']}"
+        if row["admin_username"]
+        else f"id {row['admin_id']}"
+    )
+    nickname = str(row["profile_nickname"] or "анкета")
+    return f"{when} · {admin_name} · {nickname}"[:64]
+
+
+def username_logs_view(page: int) -> tuple[str, InlineKeyboardMarkup, bool]:
+    limit = 8
+    rows = DB.execute(
+        """
+        SELECT *
+        FROM username_view_logs
+        ORDER BY id DESC
+        LIMIT ? OFFSET ?
+        """,
+        (limit + 1, page * limit),
+    ).fetchall()
+    has_next = len(rows) > limit
+    rows = rows[:limit]
+    has_prev = page > 0
+
+    if not rows:
+        text = (
+            "<b>Логи</b>\n\n"
+            "Пока никто из админов не открывал юзернеймы анкет."
+            if page == 0
+            else "<b>Логи</b>\n\nДальше записей нет."
+        )
+        return text, logs_keyboard(page, [], has_prev, False), has_next
+
+    text = (
+        "<b>Логи</b>\n\n"
+        "Каждая кнопка — отдельный просмотр юзернейма.\n"
+        "Нажмите, чтобы открыть анкету и сам юзернейм."
+    )
+    return text, logs_keyboard(page, rows, has_prev, has_next), has_next
+
+
+def logs_keyboard(
+    page: int,
+    rows,
+    has_prev: bool,
+    has_next: bool,
+) -> InlineKeyboardMarkup:
+    buttons = []
+
+    for row in rows:
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text=username_log_label(row),
+                    callback_data=f"super:log:{int(row['id'])}",
+                )
+            ]
+        )
+
+    navigation = []
+
+    if has_prev:
+        navigation.append(
+            InlineKeyboardButton(
+                text="⬅️",
+                callback_data=f"super:logs:{page - 1}",
+            )
+        )
+
+    if has_next:
+        navigation.append(
+            InlineKeyboardButton(
+                text="➡️",
+                callback_data=f"super:logs:{page + 1}",
+            )
+        )
+
+    if navigation:
+        buttons.append(navigation)
+
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text="⬅️ В панель",
+                callback_data="super:menu",
+            )
+        ]
+    )
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def tiktok_people(limit: int, offset: int):
+    return DB.execute(
+        """
+        SELECT
+            user_id,
+            COUNT(*) AS count,
+            MAX(created) AS last_created
+        FROM tiktok_submissions
+        GROUP BY user_id
+        ORDER BY last_created DESC, user_id
+        LIMIT ? OFFSET ?
+        """,
+        (limit, offset),
+    ).fetchall()
+
+
+def tiktok_people_keyboard(page: int) -> tuple[str, InlineKeyboardMarkup | None]:
+    limit = 8
+    rows = tiktok_people(limit + 1, page * limit)
+    has_next = len(rows) > limit
+    rows = rows[:limit]
+
+    if not rows and page == 0:
+        return (
+            "<b>Тиктоки</b>\n\nПока никто не отправлял ссылки на выплату.",
+            InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="⬅️ В панель",
+                            callback_data="super:menu",
+                        )
+                    ]
+                ]
+            ),
+        )
+
+    if not rows:
+        return "", None
+
+    buttons = []
+
+    for row in rows:
+        user_id = int(row["user_id"])
+        username = stored_username(user_id)
+        count = int(row["count"])
+
+        if username:
+            label = f"@{username} · {count}"
+        else:
+            label = f"{person_label(user_id)} · {count}"
+
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text=label[:64],
+                    callback_data=f"super:tiktok_user:{user_id}",
+                )
+            ]
+        )
+
+    navigation = []
+
+    if page > 0:
+        navigation.append(
+            InlineKeyboardButton(
+                text="⬅️",
+                callback_data=f"super:tiktoks:{page - 1}",
+            )
+        )
+
+    if has_next:
+        navigation.append(
+            InlineKeyboardButton(
+                text="➡️",
+                callback_data=f"super:tiktoks:{page + 1}",
+            )
+        )
+
+    if navigation:
+        buttons.append(navigation)
+
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text="⬅️ В панель",
+                callback_data="super:menu",
+            )
+        ]
+    )
+
+    return (
+        "<b>Тиктоки</b>\n\n"
+        "Каждая кнопка — отдельный человек. "
+        "На ней юзернейм и число ссылок.",
+        InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
+
+def tiktok_user_text(user_id: int) -> str:
+    rows = DB.execute(
+        """
+        SELECT link, created
+        FROM tiktok_submissions
+        WHERE user_id = ?
+        ORDER BY id DESC
+        """,
+        (user_id,),
+    ).fetchall()
+    username = stored_username(user_id)
+    shown = f"@{html.escape(username)}" if username else "не задан"
+    profile = get_profile(user_id)
+    nickname = (
+        html.escape(str(profile["nickname"]))
+        if profile and profile["nickname"]
+        else "нет анкеты"
+    )
+    lines = [
+        "<b>Тиктоки на выплату</b>",
+        f"Юзернейм: {shown}",
+        f"Telegram ID: <code>{user_id}</code>",
+        f"Анкета: {nickname}",
+        "",
+    ]
+
+    if not rows:
+        lines.append("Ссылок нет.")
+        return "\n".join(lines)
+
+    for index, row in enumerate(rows[:30], start=1):
+        lines.append(
+            f"{index}. {html.escape(format_msk(row['created']))}\n"
+            f"{html.escape(row['link'])}"
+        )
+
+    if len(rows) > 30:
+        lines.append("")
+        lines.append(f"И ещё {len(rows) - 30} более ранних ссылок.")
+
+    return "\n".join(lines)
+
+
+@router.callback_query(F.data.startswith("super:"))
+async def superadmin_callback(
+    callback: CallbackQuery,
+    state: FSMContext,
+    bot: Bot,
+):
+    if not is_superadmin(callback.from_user.id):
+        await callback.answer(
+            "Нет доступа.",
+            show_alert=True,
+        )
+        return
+
+    parts = (callback.data or "").split(":")
+    action = parts[1] if len(parts) > 1 else ""
+
+    if action == "menu":
+        await state.clear()
+        await callback.answer()
+
+        if callback.message:
+            await edit_or_send(
+                callback.message,
+                "Панель супер-админа:",
+                reply_markup=superadmin_keyboard(),
+            )
+
+        return
+
+    if action == "add":
+        await state.set_state(SuperAdminForm.admin_query)
+        await callback.answer()
+
+        if callback.message:
+            await callback.message.answer(
+                "Кого назначить админом?\n"
+                "Пришлите Telegram ID или @username.\n\n"
+                "Отмена — /cancel"
+            )
+
+        return
+
+    if action == "remove":
+        await state.clear()
+        ids = [
+            user_id
+            for user_id in removable_admin_ids()
+            if user_id != callback.from_user.id
+        ]
+        await callback.answer()
+
+        if not callback.message:
+            return
+
+        if not ids:
+            await edit_or_send(
+                callback.message,
+                "<b>Снять админа</b>\n\n"
+                "Снимать некого.\n"
+                "Админов из ADMIN_IDS можно снять здесь.\n"
+                "Себя и супер-админов из SUPERADMIN_IDS — нет.",
+                InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(
+                                text="⬅️ В панель",
+                                callback_data="super:menu",
+                            )
+                        ]
+                    ]
+                ),
+            )
+            return
+
+        buttons = [
+            [
+                InlineKeyboardButton(
+                    text=admin_remove_label(user_id),
+                    callback_data=f"super:revoke:{user_id}",
+                )
+            ]
+            for user_id in ids[:30]
+        ]
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text="⬅️ В панель",
+                    callback_data="super:menu",
+                )
+            ]
+        )
+        await edit_or_send(
+            callback.message,
+            "<b>Снять админа</b>\n\n"
+            "Выберите человека.\n"
+            "Можно снять админа из ADMIN_IDS "
+            "и назначенного через эту панель.\n"
+            "Супер-админа из SUPERADMIN_IDS снять нельзя.",
+            InlineKeyboardMarkup(inline_keyboard=buttons),
+        )
+        return
+
+    if action == "revoke" and len(parts) > 2 and parts[2].isdigit():
+        target_id = int(parts[2])
+        await callback.answer()
+
+        if callback.message:
+            await edit_or_send(
+                callback.message,
+                "Снять права администратора у "
+                f"{html.escape(person_label(target_id))}?",
+                InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(
+                                text="Да, снять",
+                                callback_data=f"super:revoke_yes:{target_id}",
+                            ),
+                            InlineKeyboardButton(
+                                text="Отмена",
+                                callback_data="super:remove",
+                            ),
+                        ]
+                    ]
+                ),
+            )
+
+        return
+
+    if action == "revoke_yes" and len(parts) > 2 and parts[2].isdigit():
+        target_id = int(parts[2])
+
+        if target_id == callback.from_user.id:
+            await callback.answer(
+                "Себя снять нельзя.",
+                show_alert=True,
+            )
+            return
+
+        if target_id in SUPERADMIN_IDS:
+            await callback.answer(
+                "Супер-админа из SUPERADMIN_IDS нельзя снять отсюда.",
+                show_alert=True,
+            )
+            return
+
+        removed_env = False
+        removed_db = False
+
+        if target_id in ADMIN_IDS and not is_env_admin_revoked(target_id):
+            revoke_env_admin(target_id, callback.from_user.id)
+            removed_env = True
+
+        if is_db_admin(target_id):
+            revoke_admin(target_id)
+            removed_db = True
+
+        if not removed_env and not removed_db:
+            await callback.answer(
+                "Этот админ уже снят.",
+                show_alert=True,
+            )
+            return
+
+        await notify_admin_role(bot, target_id, False)
+        await callback.answer("Права сняты.")
+
+        if callback.message:
+            await edit_or_send(
+                callback.message,
+                "Права сняты: "
+                f"{html.escape(person_label(target_id))}.",
+                superadmin_keyboard(),
+            )
+
+        return
+
+    if action == "grant" and len(parts) > 2 and parts[2].isdigit():
+        await state.clear()
+        text = await appoint_admin_user(
+            bot,
+            callback.from_user.id,
+            int(parts[2]),
+        )
+        await callback.answer("Готово.")
+
+        if callback.message:
+            await callback.message.answer(
+                text,
+                reply_markup=superadmin_keyboard(),
+            )
+
+        return
+
+    if action == "logs" and len(parts) > 2 and parts[2].isdigit():
+        page = int(parts[2])
+        text, markup, has_next = username_logs_view(page)
+
+        if page > 0 and not has_next and "Дальше записей нет" in text:
+            await callback.answer(
+                "Дальше записей нет.",
+                show_alert=True,
+            )
+            return
+
+        await callback.answer()
+
+        if callback.message:
+            await edit_or_send(
+                callback.message,
+                text,
+                markup,
+            )
+
+        return
+
+    if action == "log" and len(parts) > 2 and parts[2].isdigit():
+        log_id = int(parts[2])
+        row = DB.execute(
+            """
+            SELECT *
+            FROM username_view_logs
+            WHERE id = ?
+            """,
+            (log_id,),
+        ).fetchone()
+
+        if not row:
+            await callback.answer(
+                "Запись не найдена.",
+                show_alert=True,
+            )
+            return
+
+        await callback.answer()
+
+        if not callback.message:
+            return
+
+        target_id = int(row["target_id"])
+        username = str(row["target_username"] or "").strip()
+        shown = f"@{html.escape(username)}" if username else "не задан"
+        admin_name = (
+            f"@{row['admin_username']}"
+            if row["admin_username"]
+            else f"id {row['admin_id']}"
+        )
+        nickname = html.escape(str(row["profile_nickname"] or "без имени"))
+        header = (
+            "<b>Просмотр юзернейма</b>\n"
+            f"Когда: {html.escape(format_msk(row['created']))}\n"
+            f"Кто смотрел: {html.escape(admin_name)} "
+            f"(<code>{row['admin_id']}</code>)\n"
+            f"Анкета: {nickname}\n"
+            f"Юзернейм: {shown}\n"
+            f"Telegram ID: <code>{target_id}</code>"
+        )
+        back = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="⬅️ К логам",
+                        callback_data="super:logs:0",
+                    )
+                ]
+            ]
+        )
+        profile = get_profile(target_id)
+
+        if not profile:
+            await edit_or_send(
+                callback.message,
+                header + "\n\nАнкета уже удалена.",
+                back,
+            )
+            return
+
+        await edit_or_send(
+            callback.message,
+            header,
+            back,
+        )
+        await send_profile(
+            callback.message,
+            profile,
+            reveal_contacts=True,
+        )
+        return
+
+    if action == "tiktoks" and len(parts) > 2 and parts[2].isdigit():
+        page = int(parts[2])
+        text, markup = tiktok_people_keyboard(page)
+
+        if not text:
+            await callback.answer(
+                "Дальше никого нет.",
+                show_alert=True,
+            )
+            return
+
+        await callback.answer()
+
+        if callback.message and markup is not None:
+            await edit_or_send(
+                callback.message,
+                text,
+                markup,
+            )
+
+        return
+
+    if action == "tiktok_user" and len(parts) > 2 and parts[2].isdigit():
+        target_id = int(parts[2])
+        await callback.answer()
+
+        if callback.message:
+            await edit_or_send(
+                callback.message,
+                tiktok_user_text(target_id),
+                InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(
+                                text="⬅️ К людям",
+                                callback_data="super:tiktoks:0",
+                            )
+                        ]
+                    ]
+                ),
+            )
+
+        return
+
+    await callback.answer(
+        "Некорректный запрос.",
+        show_alert=True,
+    )
+
+
+@router.message(
+    StateFilter(SuperAdminForm.admin_query),
+    F.text,
+)
+async def superadmin_appoint_query(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+):
+    if not is_superadmin(message.from_user.id):
+        await state.clear()
+        return
+
+    matches = resolve_admin_query(message.text or "")
+
+    if matches is None:
+        await message.answer(
+            "Пришлите Telegram ID или @username, либо /cancel."
+        )
+        return
+
+    if not matches:
+        await message.answer(
+            "Никого не нашёл. Нужен Telegram ID или @username "
+            "человека, который уже открывал бота."
+        )
+        return
+
+    if len(matches) == 1:
+        await state.clear()
+        text = await appoint_admin_user(
+            bot,
+            message.from_user.id,
+            matches[0],
+        )
+        await message.answer(
+            text,
+            reply_markup=superadmin_keyboard(),
+        )
+        return
+
+    buttons = [
+        [
+            InlineKeyboardButton(
+                text=person_label(user_id)[:64],
+                callback_data=f"super:grant:{user_id}",
+            )
+        ]
+        for user_id in matches[:20]
+    ]
+    await message.answer(
+        "Нашлось несколько человек. Выберите:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
+
+@router.callback_query(F.data == "tiktok:submit")
+async def tiktok_submit_start(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
+    await state.clear()
+    await state.set_state(TikTokForm.link)
+    await callback.answer()
+
+    if callback.message:
+        await callback.message.answer(
+            "Пришлите ссылку на тикток.\n"
+            "Можно несколько ссылок, каждую с новой строки.\n"
+            "Обычный текст бот не примет.\n\n"
+            "Отмена — /cancel"
+        )
+
+
+@router.message(
+    StateFilter(TikTokForm.link),
+    F.text,
+)
+async def tiktok_submit_link(
+    message: Message,
+    state: FSMContext,
+):
+    links = extract_submission_links(message.text or "")
+
+    if not links:
+        await message.answer(
+            "Нужна только ссылка, например https://www.tiktok.com/...\n"
+            "Отмена — /cancel."
+        )
+        return
+
+    saved = 0
+    duplicates = 0
+
+    for link in links:
+        try:
+            if add_tiktok_submission(message.from_user.id, link):
+                saved += 1
+            else:
+                duplicates += 1
+        except Exception as error:
+            DB.rollback()
+            print(f"Тикток {message.from_user.id}: {error}")
+            await message.answer(
+                "Не удалось сохранить ссылку. Отправьте её ещё раз.",
+                parse_mode=None,
+            )
+            return
+
+    lines = []
+
+    if saved:
+        lines.append(f"Принято ссылок: {saved}.")
+
+    if duplicates:
+        lines.append(f"Уже были отправлены: {duplicates}.")
+
+    lines.append("Можно прислать ещё одну ссылку или нажать /cancel.")
+    await message.answer("\n".join(lines))
+
+
+@router.message(StateFilter(TikTokForm.link))
+async def tiktok_submit_invalid(message: Message):
+    await message.answer(
+        "Можно отправить только ссылку текстом или нажать /cancel."
+    )
+
 
 router.message.outer_middleware(GateMiddleware())
 router.callback_query.outer_middleware(GateMiddleware())
