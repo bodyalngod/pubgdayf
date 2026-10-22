@@ -231,6 +231,10 @@ class TikTokForm(StatesGroup):
     link = State()
 
 
+class ProblemForm(StatesGroup):
+    description = State()
+
+
 PROFILE_FIELDS = [
     "nickname",
     "gender",
@@ -539,6 +543,28 @@ def init_database() -> None:
             day TEXT NOT NULL,
             PRIMARY KEY (user_id, target_id, day)
         );
+
+        CREATE TABLE IF NOT EXISTS problems (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            username TEXT,
+            text TEXT NOT NULL,
+            created TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_problems_created
+            ON problems(created);
+
+        CREATE TABLE IF NOT EXISTS problem_view_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            admin_id INTEGER NOT NULL,
+            admin_username TEXT,
+            problem_id INTEGER NOT NULL,
+            reporter_id INTEGER NOT NULL,
+            reporter_username TEXT,
+            problem_text TEXT,
+            created TEXT NOT NULL
+        );
         """
     )
 
@@ -840,6 +866,92 @@ def log_username_view(
             target_id,
             target_username or None,
             nickname or None,
+            current_time(),
+        ),
+    )
+    DB.commit()
+
+
+def add_problem(user_id: int, username: str, text: str) -> int:
+    cursor = DB.execute(
+        """
+        INSERT INTO problems (
+            user_id,
+            username,
+            text,
+            created
+        )
+        VALUES (?, ?, ?, ?)
+        """,
+        (
+            user_id,
+            (username or "").strip() or None,
+            text,
+            current_time(),
+        ),
+    )
+    DB.commit()
+    return int(cursor.lastrowid)
+
+
+def get_problem(problem_id: int):
+    return DB.execute(
+        """
+        SELECT *
+        FROM problems
+        WHERE id = ?
+        """,
+        (problem_id,),
+    ).fetchone()
+
+
+def problem_sender_tag(user_id: int, snapshot: str | None) -> str:
+    username = stored_username(user_id) or str(snapshot or "").strip()
+
+    if username:
+        return "@" + username
+
+    return f"id {user_id}"
+
+
+def problem_list_label(row) -> str:
+    tag = problem_sender_tag(
+        int(row["user_id"]),
+        row["username"],
+    )
+    body = " ".join(str(row["text"] or "").split())
+    return f"{tag}: {body}"[:64]
+
+
+def log_problem_view(
+    admin_id: int,
+    admin_username: str,
+    problem,
+) -> None:
+    reporter_id = int(problem["user_id"])
+    reporter_username = stored_username(reporter_id) or str(
+        problem["username"] or ""
+    ).strip()
+    DB.execute(
+        """
+        INSERT INTO problem_view_logs (
+            admin_id,
+            admin_username,
+            problem_id,
+            reporter_id,
+            reporter_username,
+            problem_text,
+            created
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            admin_id,
+            admin_username or None,
+            int(problem["id"]),
+            reporter_id,
+            reporter_username or None,
+            str(problem["text"] or ""),
             current_time(),
         ),
     )
@@ -2797,6 +2909,12 @@ def admin_keyboard() -> InlineKeyboardMarkup:
                     callback_data="admin:premium",
                 ),
             ],
+            [
+                InlineKeyboardButton(
+                    text="Проблемы",
+                    callback_data="admin:problems:0",
+                ),
+            ],
         ]
     )
 
@@ -4133,12 +4251,25 @@ async def command_start(
     )
 
 
+def help_report_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Сообщить о проблеме",
+                    callback_data="problem:report",
+                )
+            ]
+        ]
+    )
+
+
 @router.message(Command("help"))
 async def command_help(message: Message):
     await send_template(
         message,
         "help",
-        keyboard_for(message.from_user.id),
+        help_report_keyboard(),
     )
 
 
@@ -4216,6 +4347,129 @@ async def command_superadmin(
     await message.answer(
         "Панель супер-админа:",
         reply_markup=superadmin_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "problem:report")
+async def problem_report_start(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
+    await state.clear()
+    await state.set_state(ProblemForm.description)
+    await callback.answer()
+
+    if callback.message:
+        await callback.message.answer(
+            "Опишите проблему: что произошло и как это повторить.\n\n"
+            "Отмена — /cancel"
+        )
+
+
+async def problem_menu_instead(
+    message: Message,
+    state: FSMContext,
+    text: str,
+) -> bool:
+    """Кнопка меню во время описания проблемы не должна стать текстом жалобы."""
+    if text == "📝 Моя анкета":
+        await state.clear()
+        await command_profile(message)
+        return True
+
+    if text == "ℹ️ Помощь":
+        await state.clear()
+        await command_help(message)
+        return True
+
+    if text == "🔍 Найти игрока":
+        await state.clear()
+        await command_search(message)
+        return True
+
+    if text == "Premium за приглашения":
+        await state.clear()
+        await command_prem(message, message.bot)
+        return True
+
+    if text == "Заработай на тик-токах":
+        await state.clear()
+        await menu_tiktok(message)
+        return True
+
+    if text == "🚻 Поиск по полу":
+        await state.clear()
+        await menu_search_gender(message)
+        return True
+
+    if text == "⬆️ Поднять в топ":
+        await state.clear()
+        await menu_boost(message)
+        return True
+
+    if text == "✏️ Создать / изменить анкету":
+        await state.clear()
+        await start_profile_form(message, state)
+        return True
+
+    if text == "🗑 Удалить мою анкету":
+        await state.clear()
+        await delete_my_profile_request(message)
+        return True
+
+    return False
+
+
+@router.message(
+    StateFilter(ProblemForm.description),
+    F.text,
+)
+async def problem_report_text(
+    message: Message,
+    state: FSMContext,
+):
+    text = (message.text or "").strip()
+
+    if await problem_menu_instead(message, state, text):
+        return
+
+    if not text or text.startswith("/"):
+        await message.answer(
+            "Нужно описание проблемы обычным текстом.\n"
+            "Отмена — /cancel."
+        )
+        return
+
+    if len(text) > 3500:
+        await message.answer(
+            "Слишком длинное описание. Сократите его и отправьте ещё раз."
+        )
+        return
+
+    username = (message.from_user.username or "").strip()
+
+    try:
+        add_problem(message.from_user.id, username, text)
+    except Exception as error:
+        DB.rollback()
+        print(f"Проблема {message.from_user.id}: {error}")
+        await message.answer(
+            "Не удалось отправить сообщение. Попробуйте ещё раз.",
+            parse_mode=None,
+        )
+        return
+
+    await state.clear()
+    await message.answer(
+        "Сообщение о проблеме отправлено.",
+        reply_markup=keyboard_for(message.from_user.id),
+    )
+
+
+@router.message(StateFilter(ProblemForm.description))
+async def problem_report_invalid(message: Message):
+    await message.answer(
+        "Опишите проблему текстом или нажмите /cancel."
     )
 
 
@@ -6260,6 +6514,167 @@ async def admin_callback(
 
         return
 
+    if action == "problems":
+        page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+        limit = 8
+        rows = DB.execute(
+            """
+            SELECT id, user_id, username, text, created
+            FROM problems
+            ORDER BY id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (limit + 1, page * limit),
+        ).fetchall()
+        has_next = len(rows) > limit
+        rows = rows[:limit]
+
+        if not rows and page > 0:
+            await callback.answer(
+                "Дальше проблем нет.",
+                show_alert=True,
+            )
+            return
+
+        await callback.answer()
+
+        if not callback.message:
+            return
+
+        buttons = []
+
+        for row in rows:
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        text=problem_list_label(row),
+                        callback_data=f"admin:problem:{int(row['id'])}",
+                    )
+                ]
+            )
+
+        navigation = []
+
+        if page > 0:
+            navigation.append(
+                InlineKeyboardButton(
+                    text="⬅️",
+                    callback_data=f"admin:problems:{page - 1}",
+                )
+            )
+
+        if has_next:
+            navigation.append(
+                InlineKeyboardButton(
+                    text="➡️",
+                    callback_data=f"admin:problems:{page + 1}",
+                )
+            )
+
+        if navigation:
+            buttons.append(navigation)
+
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text="⬅️ В админ-панель",
+                    callback_data="admin:menu",
+                )
+            ]
+        )
+
+        if rows:
+            text = (
+                f"<b>Проблемы</b> — страница {page + 1}\n\n"
+                "Каждая кнопка — отдельное сообщение: "
+                "тег отправителя и текст проблемы.\n"
+                "Нажмите, чтобы открыть полностью."
+            )
+        else:
+            text = (
+                "<b>Проблемы</b>\n\n"
+                "Пока никто не сообщал о проблемах."
+            )
+
+        await edit_or_send(
+            callback.message,
+            text,
+            InlineKeyboardMarkup(inline_keyboard=buttons),
+        )
+        return
+
+    if action == "problem":
+        if len(parts) < 3 or not parts[2].isdigit():
+            await callback.answer(
+                "Проблема не найдена.",
+                show_alert=True,
+            )
+            return
+
+        problem_id = int(parts[2])
+        problem = get_problem(problem_id)
+
+        if not problem:
+            await callback.answer(
+                "Проблема не найдена.",
+                show_alert=True,
+            )
+            return
+
+        admin_id = callback.from_user.id
+        admin_username = (
+            stored_username(admin_id)
+            or (callback.from_user.username or "")
+        )
+
+        try:
+            log_problem_view(admin_id, admin_username, problem)
+        except Exception as error:
+            DB.rollback()
+            print(f"Лог проблемы {problem_id}: {error}")
+            await callback.answer(
+                "Не удалось открыть проблему.",
+                show_alert=True,
+            )
+            return
+
+        await callback.answer()
+
+        if not callback.message:
+            return
+
+        reporter_id = int(problem["user_id"])
+        tag = html.escape(
+            problem_sender_tag(reporter_id, problem["username"])
+        )
+        body = html.escape(str(problem["text"] or ""))
+        text = (
+            f"<b>Проблема #{problem_id}</b>\n"
+            f"От: {tag}\n"
+            f"Telegram ID: <code>{reporter_id}</code>\n"
+            f"Когда: {html.escape(format_msk(problem['created']))}\n\n"
+            f"{body}"
+        )
+
+        if len(text) > 4000:
+            text = text[:3999] + "…"
+
+        await edit_or_send(
+            callback.message,
+            text,
+            InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="⬅️ К проблемам",
+                            callback_data="admin:problems:0",
+                        )
+                    ]
+                ]
+            ),
+        )
+        return
+
     if action == "messages":
         await callback.answer()
 
@@ -7195,28 +7610,68 @@ async def appoint_admin_user(
     return f"Админ назначен: {html.escape(person_label(target_id))}.{extra}"
 
 
-def username_log_label(row) -> str:
+def fetch_admin_logs(limit: int, offset: int):
+    return DB.execute(
+        """
+        SELECT
+            kind,
+            id,
+            created,
+            admin_id,
+            admin_username,
+            title,
+            extra
+        FROM (
+            SELECT
+                'username' AS kind,
+                id,
+                created,
+                admin_id,
+                admin_username,
+                profile_nickname AS title,
+                target_username AS extra
+            FROM username_view_logs
+            UNION ALL
+            SELECT
+                'problem' AS kind,
+                id,
+                created,
+                admin_id,
+                admin_username,
+                problem_text AS title,
+                reporter_username AS extra
+            FROM problem_view_logs
+        )
+        ORDER BY created DESC, id DESC
+        LIMIT ? OFFSET ?
+        """,
+        (limit, offset),
+    ).fetchall()
+
+
+def admin_log_label(row) -> str:
     when = format_msk(row["created"])
     admin_name = (
         f"@{row['admin_username']}"
         if row["admin_username"]
         else f"id {row['admin_id']}"
     )
-    nickname = str(row["profile_nickname"] or "анкета")
-    return f"{when} · {admin_name} · {nickname}"[:64]
+
+    if row["kind"] == "problem":
+        reporter = str(row["extra"] or "").strip()
+        tag = f"@{reporter}" if reporter else "без тега"
+        snippet = " ".join(str(row["title"] or "").split())
+        label = f"{when} · {admin_name} · {tag}: {snippet}"
+    else:
+        nickname = str(row["title"] or "анкета")
+        label = f"{when} · {admin_name} · {nickname}"
+
+    return label[:64]
 
 
 def username_logs_view(page: int) -> tuple[str, InlineKeyboardMarkup, bool]:
     limit = 8
-    rows = DB.execute(
-        """
-        SELECT *
-        FROM username_view_logs
-        ORDER BY id DESC
-        LIMIT ? OFFSET ?
-        """,
-        (limit + 1, page * limit),
-    ).fetchall()
+    rows = fetch_admin_logs(limit + 1, page * limit)
     has_next = len(rows) > limit
     rows = rows[:limit]
     has_prev = page > 0
@@ -7224,7 +7679,8 @@ def username_logs_view(page: int) -> tuple[str, InlineKeyboardMarkup, bool]:
     if not rows:
         text = (
             "<b>Логи</b>\n\n"
-            "Пока никто из админов не открывал юзернеймы анкет."
+            "Пока нет записей: админы не открывали "
+            "юзернеймы и проблемы."
             if page == 0
             else "<b>Логи</b>\n\nДальше записей нет."
         )
@@ -7232,8 +7688,8 @@ def username_logs_view(page: int) -> tuple[str, InlineKeyboardMarkup, bool]:
 
     text = (
         "<b>Логи</b>\n\n"
-        "Каждая кнопка — отдельный просмотр юзернейма.\n"
-        "Нажмите, чтобы открыть анкету и сам юзернейм."
+        "Каждая кнопка — просмотр юзернейма или проблемы.\n"
+        "Нажмите, чтобы открыть запись."
     )
     return text, logs_keyboard(page, rows, has_prev, has_next), has_next
 
@@ -7247,11 +7703,16 @@ def logs_keyboard(
     buttons = []
 
     for row in rows:
+        if row["kind"] == "problem":
+            callback_data = f"super:plog:{int(row['id'])}"
+        else:
+            callback_data = f"super:log:{int(row['id'])}"
+
         buttons.append(
             [
                 InlineKeyboardButton(
-                    text=username_log_label(row),
-                    callback_data=f"super:log:{int(row['id'])}",
+                    text=admin_log_label(row),
+                    callback_data=callback_data,
                 )
             ]
         )
@@ -7717,6 +8178,67 @@ async def superadmin_callback(
             callback.message,
             profile,
             reveal_contacts=True,
+        )
+        return
+
+    if action == "plog" and len(parts) > 2 and parts[2].isdigit():
+        log_id = int(parts[2])
+        row = DB.execute(
+            """
+            SELECT *
+            FROM problem_view_logs
+            WHERE id = ?
+            """,
+            (log_id,),
+        ).fetchone()
+
+        if not row:
+            await callback.answer(
+                "Запись не найдена.",
+                show_alert=True,
+            )
+            return
+
+        await callback.answer()
+
+        if not callback.message:
+            return
+
+        reporter = str(row["reporter_username"] or "").strip()
+        shown = f"@{html.escape(reporter)}" if reporter else "не задан"
+        admin_name = (
+            f"@{row['admin_username']}"
+            if row["admin_username"]
+            else f"id {row['admin_id']}"
+        )
+        body = html.escape(str(row["problem_text"] or ""))
+        text = (
+            "<b>Просмотр проблемы</b>\n"
+            f"Когда: {html.escape(format_msk(row['created']))}\n"
+            f"Кто смотрел: {html.escape(admin_name)} "
+            f"(<code>{row['admin_id']}</code>)\n"
+            f"Проблема №{int(row['problem_id'])}\n"
+            f"Отправитель: {shown}\n"
+            f"Telegram ID: <code>{row['reporter_id']}</code>\n\n"
+            f"{body}"
+        )
+
+        if len(text) > 4000:
+            text = text[:3999] + "…"
+
+        await edit_or_send(
+            callback.message,
+            text,
+            InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="⬅️ К логам",
+                            callback_data="super:logs:0",
+                        )
+                    ]
+                ]
+            ),
         )
         return
 
