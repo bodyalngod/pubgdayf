@@ -1,0 +1,2 @@
+aiogram>=3.13,<4
+nudenet==3.4.2
