@@ -1,7 +1,9 @@
-# Зависимость: pip install "aiogram>=3.13,<4"
+# Зависимость: pip install "aiogram>=3.13,<4" nudenet
 # Запуск: BOT_TOKEN=123:abc ADMIN_IDS=111,222 SUPERADMIN_IDS=111 python pubg_bot.py
 # Если SUPERADMIN_IDS не задан, супер-админами считаются ADMIN_IDS.
 # Снятие админа из ADMIN_IDS делается в панели супер-админа и хранится в базе.
+# Цензура 18+ на фото анкеты работает через nudenet. Без этой библиотеки бот
+# запустится, но проверку изображений выполнить не сможет.
 
 import asyncio
 import html
@@ -10,6 +12,7 @@ import re
 import shutil
 import sqlite3
 import struct
+import tempfile
 import time
 import zlib
 from datetime import datetime, timedelta, timezone
@@ -376,7 +379,8 @@ FIELD_OPTIONS = {
         "Сквады",
         "Метро",
         "ТДМ",
-        "Танцы",
+        "Лобби",
+        "Wow-режим",
     ],
     "voice": [
         "Да",
@@ -424,6 +428,7 @@ def init_database() -> None:
             bio TEXT NOT NULL,
             photo_file_id TEXT,
             active INTEGER NOT NULL DEFAULT 1,
+            created TEXT,
             updated TEXT NOT NULL
         );
 
@@ -599,6 +604,31 @@ def init_database() -> None:
         DB.execute(
             "ALTER TABLE profiles ADD COLUMN collection TEXT"
         )
+
+    if "created" not in columns:
+        DB.execute(
+            "ALTER TABLE profiles ADD COLUMN created TEXT"
+        )
+
+    DB.execute(
+        """
+        UPDATE profiles
+        SET mode = REPLACE(mode, 'Танцы', 'Лобби')
+        WHERE mode LIKE '%Танцы%'
+        """
+    )
+
+    DB.execute(
+        """
+        CREATE TABLE IF NOT EXISTS nsfw_bans (
+            user_id INTEGER PRIMARY KEY,
+            strikes INTEGER NOT NULL DEFAULT 0,
+            banned_until TEXT,
+            permanent INTEGER NOT NULL DEFAULT 0,
+            updated TEXT NOT NULL
+        )
+        """
+    )
 
     message_columns = {
         row["name"]
@@ -1170,6 +1200,17 @@ def format_premium_until(moment: datetime) -> str:
 def format_msk(value: str) -> str:
     try:
         return format_premium_until(parse_db_time(value))
+    except Exception:
+        return str(value)
+
+
+def format_exact_msk(value: str) -> str:
+    try:
+        return (
+            parse_db_time(value)
+            .astimezone(MSK)
+            .strftime("%d.%m.%Y, %H:%M:%S МСК")
+        )
     except Exception:
         return str(value)
 
@@ -2361,6 +2402,291 @@ async def answer_spam(message: Message, user_id: int) -> None:
         print(f"Антиспам {user_id}: {error}")
 
 
+NSFW_EXPOSED = {
+    "FEMALE_GENITALIA_EXPOSED": 0.45,
+    "MALE_GENITALIA_EXPOSED": 0.45,
+    "ANUS_EXPOSED": 0.50,
+    "FEMALE_BREAST_EXPOSED": 0.60,
+    "BUTTOCKS_EXPOSED": 0.65,
+}
+NSFW_BAN_STEPS = (
+    timedelta(minutes=1),
+    timedelta(minutes=5),
+    timedelta(minutes=30),
+    timedelta(hours=1),
+)
+_NSFW_DETECTOR = None
+_NSFW_DETECTOR_FAILED = False
+
+
+def nsfw_detector():
+    global _NSFW_DETECTOR, _NSFW_DETECTOR_FAILED
+
+    if _NSFW_DETECTOR is not None or _NSFW_DETECTOR_FAILED:
+        return _NSFW_DETECTOR
+
+    try:
+        from nudenet import NudeDetector
+
+        _NSFW_DETECTOR = NudeDetector()
+    except Exception as error:
+        _NSFW_DETECTOR_FAILED = True
+        print(
+            "Цензура 18+ не загрузилась. "
+            "Установите пакет nudenet. "
+            f"{error}"
+        )
+        return None
+
+    return _NSFW_DETECTOR
+
+
+def image_is_nsfw(path: str) -> bool:
+    detector = nsfw_detector()
+
+    if detector is None:
+        return False
+
+    detections = detector.detect(path) or []
+
+    for item in detections:
+        label = str(item.get("class") or "")
+        try:
+            score = float(item.get("score") or 0)
+        except (TypeError, ValueError):
+            score = 0
+
+        threshold = NSFW_EXPOSED.get(label)
+
+        if threshold is not None and score >= threshold:
+            print(
+                f"Фото 18+: {label} {score:.2f}",
+                flush=True,
+            )
+            return True
+
+    return False
+
+
+async def telegram_file_is_nsfw(bot: Bot, file_id: str) -> bool:
+    """
+    Скачивает фото и проверяет его.
+    Если классификатор не установлен, фото не блокируется:
+    бот пишет об этом в лог один раз.
+    """
+    suffix = ".jpg"
+    handle = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+    path = handle.name
+    handle.close()
+
+    try:
+        telegram_file = await bot.get_file(file_id)
+        await bot.download_file(telegram_file.file_path, path)
+        return await asyncio.to_thread(image_is_nsfw, path)
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def get_nsfw_ban(user_id: int):
+    try:
+        return DB.execute(
+            """
+            SELECT *
+            FROM nsfw_bans
+            WHERE user_id = ?
+            """,
+            (user_id,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+
+
+def nsfw_ban_is_active(row) -> bool:
+    if row is None:
+        return False
+
+    if int(row["permanent"] or 0):
+        return True
+
+    raw = str(row["banned_until"] or "").strip()
+
+    if not raw:
+        return False
+
+    try:
+        return parse_db_time(raw) > datetime.now(timezone.utc)
+    except Exception:
+        return False
+
+
+def nsfw_block_text(user_id: int) -> str | None:
+    row = get_nsfw_ban(user_id)
+
+    if not nsfw_ban_is_active(row):
+        return None
+
+    if int(row["permanent"] or 0):
+        return (
+            "Вы заблокированы навсегда "
+            "за повторную отправку изображений 18+."
+        )
+
+    return (
+        "Вы заблокированы до "
+        f"{format_exact_msk(row['banned_until'])} "
+        "за отправку изображения 18+."
+    )
+
+
+def register_nsfw_strike(user_id: int) -> tuple[int, datetime | None, bool]:
+    row = get_nsfw_ban(user_id)
+    strikes = int(row["strikes"] or 0) + 1 if row else 1
+    permanent = strikes > len(NSFW_BAN_STEPS)
+    until = None
+
+    if not permanent:
+        until = datetime.now(timezone.utc).replace(microsecond=0)
+        until += NSFW_BAN_STEPS[strikes - 1]
+
+    DB.execute(
+        """
+        INSERT INTO nsfw_bans (
+            user_id,
+            strikes,
+            banned_until,
+            permanent,
+            updated
+        )
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            strikes = excluded.strikes,
+            banned_until = excluded.banned_until,
+            permanent = excluded.permanent,
+            updated = excluded.updated
+        """,
+        (
+            user_id,
+            strikes,
+            format_db_time(until) if until is not None else None,
+            1 if permanent else 0,
+            current_time(),
+        ),
+    )
+    DB.commit()
+    return strikes, until, permanent
+
+
+def clear_nsfw_ban(user_id: int) -> None:
+    DB.execute(
+        "DELETE FROM nsfw_bans WHERE user_id = ?",
+        (user_id,),
+    )
+    DB.commit()
+
+
+def nsfw_reject_text(
+    until: datetime | None,
+    permanent: bool,
+) -> str:
+    lines = [
+        "Фото не принято: на изображении есть контент 18+.",
+        "Такое фото нельзя ставить в анкету.",
+    ]
+
+    if permanent:
+        lines.append(
+            "За повторные попытки вы заблокированы навсегда."
+        )
+    else:
+        lines.append(
+            "Вы заблокированы до "
+            f"{format_exact_msk(format_db_time(until))}."
+        )
+        lines.append(
+            "Если отправить такое фото снова, "
+            "блокировка станет дольше: "
+            "1 минута, 5 минут, 30 минут, час, затем навсегда."
+        )
+
+    return "\n".join(lines)
+
+
+def profile_created_line(profile) -> str:
+    try:
+        raw = str(profile["created"] or "").strip()
+    except (KeyError, IndexError):
+        raw = ""
+
+    if not raw:
+        return (
+            "Создана: время не сохранено "
+            "(анкета была до этого обновления)."
+        )
+
+    return f"Создана: {format_exact_msk(raw)}"
+
+
+async def reject_nsfw_photo(message: Message) -> None:
+    try:
+        strikes, until, permanent = register_nsfw_strike(
+            message.from_user.id
+        )
+    except Exception as error:
+        DB.rollback()
+        print(f"Не записана блокировка 18+: {error}")
+        await message.answer(
+            "Фото не принято: на изображении есть контент 18+.",
+            parse_mode=None,
+        )
+        return
+
+    print(
+        f"Блок 18+ {message.from_user.id}: "
+        f"попытка {strikes}, "
+        f"{'навсегда' if permanent else until}",
+        flush=True,
+    )
+    await message.answer(
+        nsfw_reject_text(until, permanent),
+        parse_mode=None,
+    )
+
+
+async def accept_profile_photo(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    file_id: str,
+) -> None:
+    try:
+        await message.bot.send_chat_action(message.chat.id, "typing")
+    except Exception:
+        pass
+
+    try:
+        nsfw = await telegram_file_is_nsfw(bot, file_id)
+    except Exception as error:
+        print(f"Проверка фото 18+ не выполнена: {error}")
+        await message.answer(
+            "Не удалось проверить фото. "
+            "Отправьте другое изображение."
+        )
+        return
+
+    if nsfw:
+        await reject_nsfw_photo(message)
+        return
+
+    data = await state.get_data()
+    values = data.get("values", {})
+    values["photo_file_id"] = file_id
+    await state.update_data(values=values)
+    await next_field(message, state, "photo_file_id")
+
+
 class GateMiddleware(BaseMiddleware):
     async def __call__(
         self,
@@ -2391,6 +2717,24 @@ class GateMiddleware(BaseMiddleware):
         await attribute_start_referral(event, data)
 
         user_id = user.id if user is not None else None
+        admin_event = (
+            user_id is not None
+            and await admin_configuration_event(event, data)
+        )
+
+        if user_id is not None and not admin_event:
+            block_text = nsfw_block_text(user_id)
+
+            if block_text:
+                if isinstance(event, CallbackQuery):
+                    await event.answer(
+                        block_text[:180],
+                        show_alert=True,
+                    )
+                elif isinstance(event, Message):
+                    await event.answer(block_text, parse_mode=None)
+
+                return None
 
         async def activate_referral(
             subscription_ok: bool | None = None,
@@ -2412,7 +2756,7 @@ class GateMiddleware(BaseMiddleware):
             except Exception as error:
                 print(f"Реферал не активирован {user_id}: {error}")
 
-        if user_id is None or await admin_configuration_event(event, data):
+        if user_id is None or admin_event:
             await activate_referral()
             return await handler(event, data)
 
@@ -2913,6 +3257,12 @@ def admin_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="Проблемы",
                     callback_data="admin:problems:0",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Блоки 18+",
+                    callback_data="admin:nsfw_bans:0",
                 ),
             ],
         ]
@@ -3528,42 +3878,55 @@ def admin_profile_keyboard(
         else ("all", "updated")
     )
 
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+    buttons = [
+        [
+            InlineKeyboardButton(
+                text="Узнать юзернейм",
+                callback_data=f"admin:username:{user_id}",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text=(
+                    "⏸️ Отключить показ"
+                    if active
+                    else "▶️ Включить показ"
+                ),
+                callback_data=f"admin:toggle:{user_id}",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text="🗑 Удалить анкету",
+                callback_data=(
+                    f"admin:delete_confirm:{user_id}"
+                ),
+            ),
+        ],
+    ]
+
+    if get_nsfw_ban(user_id):
+        buttons.append(
             [
                 InlineKeyboardButton(
-                    text="Узнать юзернейм",
-                    callback_data=f"admin:username:{user_id}",
+                    text="Снять блок 18+",
+                    callback_data=f"admin:nsfw_clear:{user_id}",
+                )
+            ]
+        )
+
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text="⬅️ К списку",
+                callback_data=(
+                    f"admin:profiles:0:{photo_filter}:{sort}"
                 ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text=(
-                        "⏸️ Отключить показ"
-                        if active
-                        else "▶️ Включить показ"
-                    ),
-                    callback_data=f"admin:toggle:{user_id}",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🗑 Удалить анкету",
-                    callback_data=(
-                        f"admin:delete_confirm:{user_id}"
-                    ),
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="⬅️ К списку",
-                    callback_data=(
-                        f"admin:profiles:0:{photo_filter}:{sort}"
-                    ),
-                ),
-            ],
+            ),
         ]
     )
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def admin_messages_keyboard() -> InlineKeyboardMarkup:
@@ -4186,9 +4549,10 @@ def save_profile(
             bio,
             photo_file_id,
             active,
+            created,
             updated
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
         ON CONFLICT(user_id) DO UPDATE SET
             nickname = excluded.nickname,
             gender = excluded.gender,
@@ -4204,6 +4568,7 @@ def save_profile(
             bio = excluded.bio,
             photo_file_id = excluded.photo_file_id,
             active = 1,
+            created = created,
             updated = excluded.updated
         """,
         (
@@ -4221,6 +4586,7 @@ def save_profile(
             str(values["language"]).strip(),
             bio,
             values.get("photo_file_id"),
+            current_time(),
             current_time(),
         ),
     )
@@ -5145,18 +5511,43 @@ async def profile_text_field(
 async def profile_photo(
     message: Message,
     state: FSMContext,
+    bot: Bot,
 ):
-    data = await state.get_data()
-    values = data.get("values", {})
-
-    values["photo_file_id"] = message.photo[-1].file_id
-
-    await state.update_data(values=values)
-
-    await next_field(
+    await accept_profile_photo(
         message,
         state,
-        "photo_file_id",
+        bot,
+        message.photo[-1].file_id,
+    )
+
+
+@router.message(
+    StateFilter(
+        ProfileForm.photo_file_id,
+        AdminProfileForm.photo_file_id,
+    ),
+    F.document,
+)
+async def profile_photo_document(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+):
+    document = message.document
+    mime = (document.mime_type or "") if document else ""
+
+    if not mime.startswith("image/") or document is None:
+        await message.answer(
+            "Отправьте фото или нажмите "
+            "«⏭️ Пропустить фото»."
+        )
+        return
+
+    await accept_profile_photo(
+        message,
+        state,
+        bot,
+        document.file_id,
     )
 
 
@@ -5853,11 +6244,21 @@ async def admin_callback(
 
         text = (
             f"{profile_text(profile, reveal_contacts=False, contact_note=ADMIN_HIDDEN_NOTE)}\n\n"
+            f"{profile_created_line(profile)}\n"
             f"Показ: "
             f"{'включён' if profile['active'] else 'выключен'}\n"
             f"Premium: {'да' if has_premium(user_id) else 'нет'}\n"
             f"Приглашено: {referral_count(user_id)}"
         )
+        ban_text = nsfw_block_text(user_id)
+
+        if ban_text:
+            text += f"\n{ban_text}"
+        elif get_nsfw_ban(user_id):
+            text += (
+                "\nПредупреждения за фото 18+ есть, "
+                "срок блокировки уже прошёл."
+            )
 
         await callback.answer()
 
@@ -5894,6 +6295,120 @@ async def admin_callback(
             await callback.message.answer(
                 text,
                 reply_markup=keyboard,
+            )
+
+        return
+
+    if action == "nsfw_bans":
+        page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+        limit = 8
+        rows = DB.execute(
+            """
+            SELECT user_id, strikes, banned_until, permanent
+            FROM nsfw_bans
+            ORDER BY updated DESC, user_id
+            LIMIT ? OFFSET ?
+            """,
+            (limit + 1, page * limit),
+        ).fetchall()
+        has_next = len(rows) > limit
+        rows = rows[:limit]
+
+        if not rows and page > 0:
+            await callback.answer(
+                "Дальше блокировок нет.",
+                show_alert=True,
+            )
+            return
+
+        await callback.answer()
+
+        if not callback.message:
+            return
+
+        buttons = []
+
+        for row in rows:
+            banned_id = int(row["user_id"])
+            tag = problem_sender_tag(banned_id, None)
+            if int(row["permanent"] or 0):
+                state_label = "навсегда"
+            elif nsfw_ban_is_active(row):
+                state_label = "активна"
+            else:
+                state_label = "срок прошёл"
+
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        text=f"{tag} · {state_label}"[:64],
+                        callback_data=f"admin:nsfw_clear:{banned_id}",
+                    )
+                ]
+            )
+
+        navigation = []
+
+        if page > 0:
+            navigation.append(
+                InlineKeyboardButton(
+                    text="⬅️",
+                    callback_data=f"admin:nsfw_bans:{page - 1}",
+                )
+            )
+
+        if has_next:
+            navigation.append(
+                InlineKeyboardButton(
+                    text="➡️",
+                    callback_data=f"admin:nsfw_bans:{page + 1}",
+                )
+            )
+
+        if navigation:
+            buttons.append(navigation)
+
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text="⬅️ В админ-панель",
+                    callback_data="admin:menu",
+                )
+            ]
+        )
+
+        if rows:
+            text = (
+                f"<b>Блоки 18+</b> — страница {page + 1}\n\n"
+                "Нажмите на человека, чтобы снять блок "
+                "и обнулить предупреждения."
+            )
+        else:
+            text = "<b>Блоки 18+</b>\n\nСейчас блокировок нет."
+
+        await edit_or_send(
+            callback.message,
+            text,
+            InlineKeyboardMarkup(inline_keyboard=buttons),
+        )
+        return
+
+    if action == "nsfw_clear":
+        if len(parts) < 3 or not parts[2].isdigit():
+            await callback.answer(
+                "Пользователь не найден.",
+                show_alert=True,
+            )
+            return
+
+        target_id = int(parts[2])
+        clear_nsfw_ban(target_id)
+        await callback.answer("Блок 18+ снят.")
+
+        if callback.message:
+            await callback.message.answer(
+                "Блок и предупреждения за фото 18+ сняты: "
+                f"<code>{target_id}</code>."
             )
 
         return
