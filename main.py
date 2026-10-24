@@ -238,6 +238,13 @@ class ProblemForm(StatesGroup):
     description = State()
 
 
+class TaskForm(StatesGroup):
+    prize = State()
+    goal = State()
+    invites = State()
+    duration = State()
+
+
 PROFILE_FIELDS = [
     "nickname",
     "gender",
@@ -569,6 +576,37 @@ def init_database() -> None:
             reporter_username TEXT,
             problem_text TEXT,
             created TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            prize TEXT NOT NULL,
+            goal TEXT NOT NULL,
+            invites_required INTEGER NOT NULL,
+            deadline TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            winner_id INTEGER,
+            created TEXT NOT NULL,
+            finished TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS task_invites (
+            task_id INTEGER NOT NULL,
+            referred_id INTEGER NOT NULL,
+            referrer_id INTEGER NOT NULL,
+            created TEXT NOT NULL,
+            PRIMARY KEY (task_id, referred_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_task_invites_referrer
+            ON task_invites(task_id, referrer_id);
+
+        CREATE TABLE IF NOT EXISTS pending_task_invites (
+            task_id INTEGER NOT NULL,
+            referred_id INTEGER NOT NULL,
+            referrer_id INTEGER NOT NULL,
+            created TEXT NOT NULL,
+            PRIMARY KEY (task_id, referred_id)
         );
         """
     )
@@ -1144,6 +1182,39 @@ def referrer_id_from_start(message) -> int | None:
     return referrer_id
 
 
+def task_ref_from_start(message) -> tuple[int, int] | None:
+    """Ссылка задания: /start task_<id>_<referrer>. Не путать с ref_ Premium."""
+    text = (getattr(message, "text", None) or "").strip()
+    parts = text.split(maxsplit=1)
+
+    if len(parts) < 2:
+        return None
+
+    command = parts[0].split("@", 1)[0]
+
+    if command != "/start":
+        return None
+
+    payload = parts[1].strip().split()[0]
+
+    if not payload.startswith("task_"):
+        return None
+
+    rest = payload[5:]
+    bits = rest.split("_", 1)
+
+    if len(bits) != 2 or not bits[0].isdigit() or not bits[1].isdigit():
+        return None
+
+    task_id = int(bits[0])
+    referrer_id = int(bits[1])
+
+    if task_id <= 0 or referrer_id <= 0:
+        return None
+
+    return task_id, referrer_id
+
+
 def referral_count(user_id: int) -> int:
     row = DB.execute(
         """
@@ -1691,6 +1762,18 @@ async def attribute_start_referral(event, data: dict) -> None:
     user = getattr(event, "from_user", None)
 
     if user is None:
+        return
+
+    task_ref = task_ref_from_start(event)
+
+    if task_ref:
+        task_id, referrer_id = task_ref
+
+        try:
+            add_pending_task_invite(task_id, user.id, referrer_id)
+        except Exception as error:
+            print(f"Задание: приглашение не записано: {error}")
+
         return
 
     referrer_id = referrer_id_from_start(event)
@@ -2319,6 +2402,7 @@ ADMIN_STATE_PREFIXES = (
     "ChannelForm:",
     "PremiumAdminForm:",
     "SuperAdminForm:",
+    "TaskForm:",
 )
 
 
@@ -2756,6 +2840,15 @@ class GateMiddleware(BaseMiddleware):
             except Exception as error:
                 print(f"Реферал не активирован {user_id}: {error}")
 
+            try:
+                await maybe_activate_task_invites(
+                    bot,
+                    user_id,
+                    subscription_ok=subscription_ok,
+                )
+            except Exception as error:
+                print(f"Задание не активировано {user_id}: {error}")
+
         if user_id is None or admin_event:
             await activate_referral()
             return await handler(event, data)
@@ -2837,6 +2930,51 @@ DEFAULT_MESSAGES = {
         "Вы давно не заходили.\n\n"
         "Анкеты напарников в PUBG уже ждут — "
         "откройте бота и нажмите «🔍 Найти игрока»."
+    ),
+    "task_broadcast": (
+        "🎁 Розыгрыш\n\n"
+        "Приз: {prize}\n\n"
+        "{goal}\n\n"
+        "Нужно пригласить: {invites}\n"
+        "Успеть до: {deadline}\n\n"
+        "Кто первым приведёт это число новых людей — получает приз.\n"
+        "По этой ссылке приглашения считаются только в розыгрыше "
+        "и не идут в Premium.\n"
+        "В зачёт идут только те, кто впервые открыл бота по вашей ссылке. "
+        "Если включена обязательная подписка, человек засчитывается после неё.\n\n"
+        "Ваша ссылка:\n"
+        "{link}"
+    ),
+    "task_progress": (
+        "Приглашение в розыгрыше засчитано.\n"
+        "Прогресс: {progress} из {invites}.\n"
+        "Осталось: {left}.\n\n"
+        "Приз: {prize}\n"
+        "Срок до: {deadline}\n\n"
+        "Ваша ссылка:\n"
+        "{link}"
+    ),
+    "task_win": (
+        "🎉 Вы успели первым и победили в розыгрыше.\n\n"
+        "Приз: {prize}\n"
+        "Цель: {goal}\n\n"
+        "С вами свяжется администрация."
+    ),
+    "task_participant": (
+        "Розыгрыш завершён: победитель уже определён.\n\n"
+        "{winner} первым пригласил нужное количество людей.\n\n"
+        "Не расстраивайтесь и постарайтесь выиграть в следующем розыгрыше.\n\n"
+        "Приз: {prize}"
+    ),
+    "task_announce": (
+        "Победитель розыгрыша объявлен: {winner}\n\n"
+        "Приз: {prize}"
+    ),
+    "task_expired": (
+        "Срок розыгрыша истёк, победитель не определён.\n\n"
+        "Приз: {prize}\n"
+        "Цель: {goal}\n"
+        "Нужно было пригласить: {invites}"
     ),
 }
 
@@ -3251,6 +3389,12 @@ def admin_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="⭐ Premium",
                     callback_data="admin:premium",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🎯 Задания",
+                    callback_data="admin:tasks",
                 ),
             ],
             [
@@ -3949,6 +4093,15 @@ def admin_messages_keyboard() -> InlineKeyboardMarkup:
         ]
         for key, title in names.items()
     ]
+
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text="Задание",
+                callback_data="admin:task_templates",
+            )
+        ]
+    )
 
     buttons.append(
         [
@@ -6117,6 +6270,1462 @@ async def process_swipe(
 
 
 # ============================================================
+# ЗАДАНИЯ / РОЗЫГРЫШИ
+# ============================================================
+
+TASK_MESSAGE_NAMES = {
+    "task_broadcast": "Рассылка задания",
+    "task_progress": "Прогресс приглашения",
+    "task_win": "Победителю",
+    "task_participant": "Кто уже приглашал",
+    "task_announce": "Кто не приглашал",
+    "task_expired": "Срок истёк без победителя",
+}
+
+_TASK_SEND_LOCK: set[int] = set()
+_BACKGROUND_JOBS: set[asyncio.Task] = set()
+_DURATION_RE = re.compile(
+    r"^(\d+)\s*(м|m|мин|минут|минуты|минута|min|ч|h|час|часа|часов|д|d|дн|день|дня|дней)?$",
+    re.IGNORECASE,
+)
+
+
+def spawn_job(coro) -> None:
+    job = asyncio.create_task(coro)
+    _BACKGROUND_JOBS.add(job)
+    job.add_done_callback(_BACKGROUND_JOBS.discard)
+
+
+def ru_count(number: int, one: str, few: str, many: str) -> str:
+    value = abs(int(number)) % 100
+    tail = value % 10
+
+    if 11 <= value <= 14:
+        word = many
+    elif tail == 1:
+        word = one
+    elif 2 <= tail <= 4:
+        word = few
+    else:
+        word = many
+
+    return f"{number} {word}"
+
+
+def format_duration(seconds: int) -> str:
+    seconds = int(seconds)
+
+    if seconds % 86400 == 0:
+        return ru_count(seconds // 86400, "день", "дня", "дней")
+
+    if seconds % 3600 == 0:
+        return ru_count(seconds // 3600, "час", "часа", "часов")
+
+    return ru_count(max(1, seconds // 60), "минута", "минуты", "минут")
+
+
+def parse_duration_seconds(text: str) -> int | None:
+    raw = (text or "").strip().casefold().replace("ё", "е")
+    match = _DURATION_RE.fullmatch(raw)
+
+    if not match:
+        return None
+
+    number = int(match.group(1))
+    unit = (match.group(2) or "ч").casefold()
+    max_seconds = 30 * 24 * 3600
+
+    if unit in {"м", "m", "мин", "минут", "минуты", "минута", "min"}:
+        seconds = number * 60
+
+        if seconds < 10 * 60 or seconds > max_seconds:
+            return None
+
+        return seconds
+
+    if unit in {"д", "d", "дн", "день", "дня", "дней"}:
+        if number < 1 or number > 30:
+            return None
+
+        return number * 86400
+
+    if number < 1 or number > 24 * 30:
+        return None
+
+    return number * 3600
+
+
+def get_task(task_id: int):
+    try:
+        return DB.execute(
+            """
+            SELECT *
+            FROM tasks
+            WHERE id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+
+
+def task_deadline_passed(task) -> bool:
+    try:
+        return parse_db_time(task["deadline"]) <= datetime.now(timezone.utc)
+    except Exception:
+        return True
+
+
+def known_bot_user(user_id: int) -> bool:
+    row = DB.execute(
+        """
+        SELECT 1
+        FROM users
+        WHERE user_id = ?
+        """,
+        (user_id,),
+    ).fetchone()
+
+    if row:
+        return True
+
+    return get_profile(user_id) is not None
+
+
+def list_tasks(limit: int = 40):
+    return DB.execute(
+        """
+        SELECT *
+        FROM tasks
+        ORDER BY
+            CASE status WHEN 'active' THEN 0 ELSE 1 END,
+            id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+
+
+def create_task(
+    prize: str,
+    goal: str,
+    invites: int,
+    deadline: datetime,
+) -> int:
+    cursor = DB.execute(
+        """
+        INSERT INTO tasks (
+            prize,
+            goal,
+            invites_required,
+            deadline,
+            status,
+            winner_id,
+            created,
+            finished
+        )
+        VALUES (?, ?, ?, ?, 'active', NULL, ?, NULL)
+        """,
+        (
+            prize,
+            goal,
+            int(invites),
+            format_db_time(deadline),
+            current_time(),
+        ),
+    )
+    DB.commit()
+    return int(cursor.lastrowid)
+
+
+def drop_pending_task_invite(task_id: int, referred_id: int) -> None:
+    try:
+        DB.execute(
+            """
+            DELETE FROM pending_task_invites
+            WHERE task_id = ? AND referred_id = ?
+            """,
+            (task_id, referred_id),
+        )
+        DB.commit()
+    except Exception:
+        DB.rollback()
+
+
+def add_pending_task_invite(
+    task_id: int,
+    referred_id: int,
+    referrer_id: int,
+) -> bool:
+    """Ждёт подписки. В Premium эту ссылку не пишем."""
+    if (
+        task_id <= 0
+        or referred_id <= 0
+        or referrer_id <= 0
+        or referred_id == referrer_id
+    ):
+        return False
+
+    task = get_task(task_id)
+
+    if (
+        not task
+        or str(task["status"]) != "active"
+        or task_deadline_passed(task)
+    ):
+        return False
+
+    if not known_bot_user(referrer_id):
+        return False
+
+    already = DB.execute(
+        """
+        SELECT 1
+        FROM task_invites
+        WHERE task_id = ? AND referred_id = ?
+        """,
+        (task_id, referred_id),
+    ).fetchone()
+
+    if already:
+        return False
+
+    try:
+        DB.execute(
+            """
+            INSERT INTO pending_task_invites (
+                task_id,
+                referred_id,
+                referrer_id,
+                created
+            )
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(task_id, referred_id) DO NOTHING
+            """,
+            (task_id, referred_id, referrer_id, current_time()),
+        )
+        DB.commit()
+    except Exception:
+        DB.rollback()
+        raise
+
+    return True
+
+
+def commit_task_invite(
+    task_id: int,
+    referred_id: int,
+    referrer_id: int,
+) -> tuple[str, int]:
+    """
+    Засчитывает приглашение только внутри задания.
+    winner — этот человек первым набрал нужное число.
+    """
+    if (
+        referred_id <= 0
+        or referrer_id <= 0
+        or referred_id == referrer_id
+    ):
+        drop_pending_task_invite(task_id, referred_id)
+        return "rejected", 0
+
+    task = get_task(task_id)
+
+    if (
+        not task
+        or str(task["status"]) != "active"
+        or task_deadline_passed(task)
+    ):
+        drop_pending_task_invite(task_id, referred_id)
+        return "closed", 0
+
+    required = int(task["invites_required"])
+    now = current_time()
+
+    try:
+        DB.execute(
+            """
+            INSERT INTO task_invites (
+                task_id,
+                referred_id,
+                referrer_id,
+                created
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            (task_id, referred_id, referrer_id, now),
+        )
+        DB.execute(
+            """
+            DELETE FROM pending_task_invites
+            WHERE task_id = ? AND referred_id = ?
+            """,
+            (task_id, referred_id),
+        )
+        count = int(
+            DB.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM task_invites
+                WHERE task_id = ? AND referrer_id = ?
+                """,
+                (task_id, referrer_id),
+            ).fetchone()["count"]
+        )
+
+        if count >= required:
+            cursor = DB.execute(
+                """
+                UPDATE tasks
+                SET status = 'finished',
+                    winner_id = ?,
+                    finished = ?
+                WHERE id = ? AND status = 'active'
+                """,
+                (referrer_id, now, task_id),
+            )
+            won = cursor.rowcount == 1
+            DB.commit()
+            return ("winner" if won else "late"), count
+
+        DB.commit()
+        return "counted", count
+    except sqlite3.IntegrityError:
+        DB.rollback()
+        drop_pending_task_invite(task_id, referred_id)
+        return "duplicate", 0
+    except Exception:
+        DB.rollback()
+        raise
+
+
+def claim_task_expired(task_id: int) -> bool:
+    cursor = DB.execute(
+        """
+        UPDATE tasks
+        SET status = 'expired',
+            finished = ?
+        WHERE id = ? AND status = 'active'
+        """,
+        (current_time(), task_id),
+    )
+    DB.commit()
+    return cursor.rowcount == 1
+
+
+def task_participants(task_id: int, limit: int, offset: int):
+    return DB.execute(
+        """
+        SELECT
+            referrer_id,
+            COUNT(*) AS count,
+            MAX(created) AS reached
+        FROM task_invites
+        WHERE task_id = ?
+        GROUP BY referrer_id
+        ORDER BY count DESC, reached ASC, referrer_id
+        LIMIT ? OFFSET ?
+        """,
+        (task_id, limit, offset),
+    ).fetchall()
+
+
+def task_participant_ids(task_id: int) -> set[int]:
+    rows = DB.execute(
+        """
+        SELECT DISTINCT referrer_id
+        FROM task_invites
+        WHERE task_id = ?
+        """,
+        (task_id,),
+    ).fetchall()
+    return {int(row["referrer_id"]) for row in rows}
+
+
+def task_status_label(task) -> str:
+    status = str(task["status"] or "")
+
+    if status == "active" and task_deadline_passed(task):
+        return "срок вышел, закрываю"
+
+    if status == "active":
+        return "идёт"
+
+    if status == "finished":
+        return "завершено, есть победитель"
+
+    if status == "expired":
+        return "срок истёк, победителя нет"
+
+    return status or "неизвестно"
+
+
+def winner_mention(user_id: int) -> str:
+    username = stored_username(user_id)
+
+    if username:
+        safe = html.escape(username)
+        return f'<a href="https://t.me/{safe}">@{safe}</a>'
+
+    label = html.escape(person_label(user_id))
+    return f'<a href="tg://user?id={int(user_id)}">{label}</a>'
+
+
+def render_task_text(key: str, task, **extra) -> str:
+    try:
+        deadline = format_premium_until(parse_db_time(task["deadline"]))
+    except Exception:
+        deadline = str(task["deadline"])
+
+    plain = {
+        "prize": str(task["prize"] or ""),
+        "goal": str(task["goal"] or ""),
+        "invites": str(task["invites_required"]),
+        "deadline": deadline,
+        "progress": str(extra.get("progress", "")),
+        "left": str(extra.get("left", "")),
+    }
+    html_fields = {
+        "winner": str(extra.get("winner", "")),
+        "link": str(extra.get("link", "")),
+    }
+
+    def replace(match):
+        name = match.group(1)
+
+        if name in html_fields:
+            return html_fields[name]
+
+        if name in plain:
+            return html.escape(plain[name])
+
+        return match.group(0)
+
+    text = re.sub(r"\{([a-z_]+)\}", replace, get_message_text(key))
+
+    if len(text) > 4000:
+        text = text[:3999] + "…"
+
+    return text or " "
+
+
+async def task_referral_link(bot: Bot, task_id: int, user_id: int) -> str:
+    username = await bot_username(bot)
+    return f"https://t.me/{username}?start=task_{task_id}_{user_id}"
+
+
+def task_share_keyboard(link: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Поделиться ссылкой",
+                    url=share_link(link),
+                )
+            ]
+        ]
+    )
+
+
+async def send_rendered_template(
+    bot: Bot,
+    chat_id: int,
+    key: str,
+    text: str,
+    reply_markup=None,
+) -> None:
+    row = get_message_row(key)
+    media = row["photo_file_id"] if row else None
+    kind, file_id = stored_media(media)
+
+    async def send_text(value: str, markup) -> None:
+        last_error = None
+
+        for parse_mode in (ParseMode.HTML, None):
+            try:
+                await bot.send_message(
+                    chat_id,
+                    value,
+                    reply_markup=markup,
+                    parse_mode=parse_mode,
+                )
+                return
+            except Exception as error:
+                if getattr(error, "retry_after", None):
+                    raise
+                last_error = error
+
+        raise RuntimeError(last_error or "Не удалось отправить текст")
+
+    if not file_id:
+        await send_text(text, reply_markup)
+        return
+
+    caption = text if text and len(text) <= 1024 else None
+    media_markup = reply_markup if caption is not None else None
+    sent = False
+
+    for parse_mode in (ParseMode.HTML, None):
+        try:
+            if kind == "document":
+                await bot.send_document(
+                    chat_id,
+                    document=file_id,
+                    caption=caption,
+                    reply_markup=media_markup,
+                    parse_mode=parse_mode,
+                )
+            else:
+                await bot.send_photo(
+                    chat_id,
+                    photo=file_id,
+                    caption=caption,
+                    reply_markup=media_markup,
+                    parse_mode=parse_mode,
+                )
+            sent = True
+            break
+        except Exception as error:
+            if getattr(error, "retry_after", None):
+                raise
+            print(f"Шаблон задания {chat_id}: {error}")
+
+    if not sent:
+        await send_text(text, reply_markup)
+        return
+
+    if caption is None and text:
+        await send_text(text, reply_markup)
+
+
+async def deliver_rendered(
+    bot: Bot,
+    chat_id: int,
+    key: str,
+    text: str,
+    reply_markup=None,
+) -> bool:
+    for attempt in range(2):
+        try:
+            await send_rendered_template(
+                bot,
+                chat_id,
+                key,
+                text,
+                reply_markup,
+            )
+            return True
+        except Exception as error:
+            retry_after = getattr(error, "retry_after", None)
+
+            if retry_after and attempt == 0:
+                await asyncio.sleep(float(retry_after) + 0.1)
+                continue
+
+            print(f"Задание {chat_id}: {error}")
+            return False
+
+    return False
+
+
+async def notify_task_progress(
+    bot: Bot,
+    task_id: int,
+    referrer_id: int,
+    count: int,
+) -> None:
+    task = get_task(task_id)
+
+    if not task:
+        return
+
+    required = int(task["invites_required"])
+    left = max(0, required - count)
+    link = await task_referral_link(bot, task_id, referrer_id)
+    text = render_task_text(
+        "task_progress",
+        task,
+        progress=str(count),
+        left=str(left),
+        link=f"<code>{html.escape(link)}</code>",
+    )
+    await deliver_rendered(
+        bot,
+        referrer_id,
+        "task_progress",
+        text,
+        task_share_keyboard(link),
+    )
+
+
+async def maybe_activate_task_invites(
+    bot: Bot,
+    user_id: int,
+    subscription_ok: bool | None = None,
+) -> None:
+    try:
+        rows = DB.execute(
+            """
+            SELECT task_id, referrer_id
+            FROM pending_task_invites
+            WHERE referred_id = ?
+            """,
+            (user_id,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return
+
+    if not rows:
+        return
+
+    if list_required_channels():
+        if subscription_ok is not True:
+            try:
+                missing = await missing_channels(bot, user_id)
+            except Exception as error:
+                print(
+                    f"Задание {user_id}: "
+                    f"не удалось проверить подписку: {error}"
+                )
+                return
+
+            if missing:
+                return
+
+    for row in rows:
+        task_id = int(row["task_id"])
+        referrer_id = int(row["referrer_id"])
+
+        try:
+            status, count = commit_task_invite(
+                task_id,
+                user_id,
+                referrer_id,
+            )
+        except Exception as error:
+            print(f"Задание {task_id}: приглашение не засчитано: {error}")
+            continue
+
+        if status == "winner":
+            print(
+                f"Задание {task_id}: победитель {referrer_id}",
+                flush=True,
+            )
+            spawn_job(announce_task_result(bot, task_id, "winner"))
+        elif status == "counted":
+            try:
+                await notify_task_progress(
+                    bot,
+                    task_id,
+                    referrer_id,
+                    count,
+                )
+            except Exception as error:
+                print(
+                    f"Задание {task_id}: "
+                    f"не сообщил прогресс {referrer_id}: {error}"
+                )
+
+
+async def announce_task_result(bot: Bot, task_id: int, kind: str) -> None:
+    task = get_task(task_id)
+
+    if not task:
+        return
+
+    winner_id = int(task["winner_id"] or 0)
+    winner_html = winner_mention(winner_id) if winner_id else ""
+    participants = task_participant_ids(task_id)
+    audience = set(broadcast_user_ids()) | participants
+    ordered: list[int] = []
+
+    if kind == "winner" and winner_id:
+        ordered.append(winner_id)
+
+    ordered.extend(
+        user_id
+        for user_id in sorted(participants)
+        if user_id != winner_id
+    )
+    ordered.extend(
+        user_id
+        for user_id in audience
+        if user_id not in participants and user_id != winner_id
+    )
+
+    sent = 0
+    failed = 0
+
+    for user_id in ordered:
+        if kind == "winner" and user_id == winner_id:
+            template_key = "task_win"
+        elif kind == "winner" and user_id in participants:
+            template_key = "task_participant"
+        elif kind == "winner":
+            template_key = "task_announce"
+        else:
+            template_key = "task_expired"
+
+        text = render_task_text(
+            template_key,
+            task,
+            winner=winner_html,
+        )
+        delivered = await deliver_rendered(
+            bot,
+            user_id,
+            template_key,
+            text,
+        )
+
+        if delivered:
+            sent += 1
+        else:
+            failed += 1
+
+        await asyncio.sleep(0.05)
+
+    print(
+        f"Итог задания {task_id} ({kind}): "
+        f"отправлено {sent}, не доставлено {failed}",
+        flush=True,
+    )
+
+
+async def broadcast_new_task(bot: Bot, task_id: int, admin_id: int) -> None:
+    task = get_task(task_id)
+
+    if not task:
+        return
+
+    sent = 0
+    failed = 0
+
+    for user_id in broadcast_user_ids():
+        try:
+            link = await task_referral_link(bot, task_id, user_id)
+        except Exception as error:
+            print(f"Ссылка задания {user_id}: {error}")
+            failed += 1
+            continue
+
+        text = render_task_text(
+            "task_broadcast",
+            task,
+            link=f"<code>{html.escape(link)}</code>",
+            progress="0",
+            left=str(task["invites_required"]),
+        )
+        delivered = await deliver_rendered(
+            bot,
+            user_id,
+            "task_broadcast",
+            text,
+            task_share_keyboard(link),
+        )
+
+        if delivered:
+            sent += 1
+        else:
+            failed += 1
+
+        await asyncio.sleep(0.05)
+
+    try:
+        await bot.send_message(
+            admin_id,
+            "Рассылка задания "
+            f"#{task_id} завершена.\n"
+            f"Доставлено: {sent}\n"
+            f"Не доставлено: {failed}",
+            reply_markup=admin_keyboard(),
+        )
+    except Exception as error:
+        print(f"Не сообщил админу об итогах задания: {error}")
+
+
+async def close_expired_tasks(bot: Bot) -> None:
+    try:
+        rows = DB.execute(
+            """
+            SELECT *
+            FROM tasks
+            WHERE status = 'active'
+            """
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return
+
+    for row in rows:
+        if not task_deadline_passed(row):
+            continue
+
+        task_id = int(row["id"])
+
+        if not claim_task_expired(task_id):
+            continue
+
+        await announce_task_result(bot, task_id, "expired")
+
+
+async def tasks_watch_loop(bot: Bot) -> None:
+    await asyncio.sleep(15)
+
+    while True:
+        try:
+            await close_expired_tasks(bot)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            print(f"Задания: {error}")
+
+        await asyncio.sleep(20)
+
+
+def task_messages_keyboard() -> InlineKeyboardMarkup:
+    buttons = [
+        [
+            InlineKeyboardButton(
+                text=title,
+                callback_data=f"admin_message:{key}",
+            )
+        ]
+        for key, title in TASK_MESSAGE_NAMES.items()
+    ]
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text="⬅️ К шаблонам",
+                callback_data="admin:messages",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def task_duration_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="1 час",
+                    callback_data="admin:task_dur:3600",
+                ),
+                InlineKeyboardButton(
+                    text="6 часов",
+                    callback_data="admin:task_dur:21600",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="24 часа",
+                    callback_data="admin:task_dur:86400",
+                ),
+                InlineKeyboardButton(
+                    text="3 дня",
+                    callback_data="admin:task_dur:259200",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="7 дней",
+                    callback_data="admin:task_dur:604800",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Отмена",
+                    callback_data="admin:task_drop",
+                ),
+            ],
+        ]
+    )
+
+
+def task_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📣 Разослать задание",
+                    callback_data="admin:task_send",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Отмена",
+                    callback_data="admin:task_drop",
+                )
+            ],
+        ]
+    )
+
+
+def tasks_list_keyboard(rows) -> InlineKeyboardMarkup:
+    buttons = [
+        [
+            InlineKeyboardButton(
+                text="➕ Создать задание",
+                callback_data="admin:task_new",
+            )
+        ]
+    ]
+
+    for row in rows:
+        if str(row["status"]) == "active" and not task_deadline_passed(row):
+            mark = "🟢"
+        elif row["winner_id"]:
+            mark = "🏆"
+        else:
+            mark = "⚪️"
+
+        prize = " ".join(str(row["prize"] or "").split())
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{mark} #{row['id']} {prize}"[:64],
+                    callback_data=f"admin:task:{int(row['id'])}:0",
+                )
+            ]
+        )
+
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text="⬅️ В админ-панель",
+                callback_data="admin:menu",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def tasks_admin_text(rows) -> str:
+    active = 0
+
+    for row in rows:
+        if str(row["status"]) == "active" and not task_deadline_passed(row):
+            active += 1
+
+    lines = [
+        "<b>Задания</b>",
+        "",
+        "Розыгрыш: кто первым пригласит нужное число новых людей, "
+        "получает приз.",
+        "Ссылка задания не считается в «Premium за приглашения».",
+        "",
+        f"Сейчас идёт: {active}.",
+        "🟢 идёт, 🏆 есть победитель, ⚪️ завершено без победителя.",
+    ]
+
+    if not rows:
+        lines.append("")
+        lines.append("Заданий пока нет.")
+
+    return "\n".join(lines)
+
+
+async def present_tasks(message: Message) -> None:
+    try:
+        rows = list_tasks()
+    except sqlite3.OperationalError:
+        rows = []
+
+    await edit_or_send(
+        message,
+        tasks_admin_text(rows),
+        tasks_list_keyboard(rows),
+    )
+
+
+def task_card_keyboard(task, page: int, has_next: bool) -> InlineKeyboardMarkup:
+    buttons = []
+    navigation = []
+    task_id = int(task["id"])
+
+    if page > 0:
+        navigation.append(
+            InlineKeyboardButton(
+                text="⬅️",
+                callback_data=f"admin:task:{task_id}:{page - 1}",
+            )
+        )
+
+    if has_next:
+        navigation.append(
+            InlineKeyboardButton(
+                text="➡️",
+                callback_data=f"admin:task:{task_id}:{page + 1}",
+            )
+        )
+
+    if navigation:
+        buttons.append(navigation)
+
+    if task["winner_id"]:
+        winner_id = int(task["winner_id"])
+        username = stored_username(winner_id)
+
+        if username:
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        text="Написать победителю",
+                        url=f"https://t.me/{username}",
+                    )
+                ]
+            )
+
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text="⬅️ К заданиям",
+                callback_data="admin:tasks",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def render_task_card(message: Message, task_id: int, page: int) -> bool:
+    task = get_task(task_id)
+
+    if not task:
+        return False
+
+    limit = 10
+    people = task_participants(task_id, limit + 1, page * limit)
+    has_next = len(people) > limit
+    people = people[:limit]
+
+    if page > 0 and not people:
+        return False
+
+    required = int(task["invites_required"])
+    lines = [
+        f"<b>Задание #{int(task['id'])}</b>",
+        f"Статус: {html.escape(task_status_label(task))}",
+        f"Приз: {html.escape(str(task['prize'] or ''))}",
+        f"Цель: {html.escape(str(task['goal'] or ''))}",
+        f"Нужно пригласить: {required}",
+        f"Срок до: {html.escape(format_msk(task['deadline']))}",
+        f"Создано: {html.escape(format_msk(task['created']))}",
+    ]
+
+    if task["winner_id"]:
+        winner_id = int(task["winner_id"])
+        username = stored_username(winner_id)
+        shown = f"@{html.escape(username)}" if username else "не задан"
+        lines.append("")
+        lines.append(f"Победитель: {winner_mention(winner_id)}")
+        lines.append(f"Юзернейм: {shown}")
+        lines.append(f"Telegram ID: <code>{winner_id}</code>")
+
+    lines.append("")
+    lines.append("<b>Кто приглашает</b>")
+
+    if not people:
+        lines.append("Пока никто не привёл людей по ссылке задания.")
+
+    for index, row in enumerate(people, start=page * limit + 1):
+        user_id = int(row["referrer_id"])
+        count = int(row["count"])
+        username = stored_username(user_id)
+
+        if username:
+            safe = html.escape(username)
+            name = f'<a href="https://t.me/{safe}">@{safe}</a>'
+        else:
+            name = html.escape(person_label(user_id))
+
+        lines.append(f"{index}. {name} — {count} из {required}")
+        lines.append(
+            f"   id <code>{user_id}</code> · "
+            f"{html.escape(format_msk(row['reached']))}"
+        )
+
+    text = "\n".join(lines)
+
+    if len(text) > 4000:
+        text = text[:3999] + "…"
+
+    await edit_or_send(
+        message,
+        text,
+        task_card_keyboard(task, page, has_next),
+    )
+    return True
+
+
+async def show_task_confirm(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    seconds = int(data["duration_seconds"])
+    deadline = datetime.now(timezone.utc).replace(microsecond=0)
+    deadline += timedelta(seconds=seconds)
+    preview = {
+        "prize": data.get("prize") or "",
+        "goal": data.get("goal") or "",
+        "invites_required": int(data.get("invites") or 0),
+        "deadline": format_db_time(deadline),
+    }
+    sample = render_task_text(
+        "task_broadcast",
+        preview,
+        link="<code>личная ссылка каждого участника</code>",
+        progress="0",
+        left=str(preview["invites_required"]),
+    )
+    header = (
+        "<b>Проверьте задание</b>\n"
+        f"Срок: {html.escape(format_duration(seconds))} "
+        f"(до {html.escape(format_premium_until(deadline))})\n"
+        "Приглашения по ссылке задания не попадают в Premium.\n\n"
+        "Так сообщение увидят участники:\n\n"
+    )
+    text = header + sample
+
+    if len(text) > 4000:
+        text = text[:3999] + "…"
+
+    try:
+        await message.answer(
+            text,
+            reply_markup=task_confirm_keyboard(),
+        )
+    except Exception as error:
+        print(f"Превью задания: {error}")
+        await message.answer(
+            text,
+            reply_markup=task_confirm_keyboard(),
+            parse_mode=None,
+        )
+
+
+async def handle_task_admin(
+    callback: CallbackQuery,
+    state: FSMContext,
+    bot: Bot,
+    parts: list[str],
+    action: str,
+) -> None:
+    if action == "tasks":
+        await state.clear()
+        await callback.answer()
+
+        if callback.message:
+            await present_tasks(callback.message)
+
+        return
+
+    if action == "task_templates":
+        await callback.answer()
+
+        if callback.message:
+            await edit_or_send(
+                callback.message,
+                "<b>Шаблоны задания</b>\n\n"
+                "Тексты розыгрыша. Бот подставляет значения сам:\n"
+                "{prize} — приз\n"
+                "{goal} — описание цели\n"
+                "{invites} — сколько людей нужно\n"
+                "{deadline} — срок по Москве\n"
+                "{link} — личная ссылка\n"
+                "{progress} — уже приглашено\n"
+                "{left} — сколько осталось\n"
+                "{winner} — кликабельный победитель",
+                task_messages_keyboard(),
+            )
+
+        return
+
+    if action == "task_new":
+        await state.clear()
+        await state.set_state(TaskForm.prize)
+        await callback.answer()
+
+        if callback.message:
+            await callback.message.answer(
+                "Новое задание.\n\n"
+                "Напишите приз.\n"
+                "Отмена — /cancel"
+            )
+
+        return
+
+    if action == "task_drop":
+        await state.clear()
+        await callback.answer("Создание отменено.")
+
+        if callback.message:
+            await present_tasks(callback.message)
+
+        return
+
+    if action == "task_dur":
+        if len(parts) < 3 or not parts[2].isdigit():
+            await callback.answer(
+                "Некорректный срок.",
+                show_alert=True,
+            )
+            return
+
+        seconds = int(parts[2])
+
+        if seconds < 600 or seconds > 30 * 24 * 3600:
+            await callback.answer(
+                "Некорректный срок.",
+                show_alert=True,
+            )
+            return
+
+        if await state.get_state() != TaskForm.duration.state:
+            await callback.answer(
+                "Сначала заново откройте создание задания.",
+                show_alert=True,
+            )
+            return
+
+        data = await state.get_data()
+
+        if not data.get("prize") or not data.get("goal") or not data.get("invites"):
+            await callback.answer(
+                "Данные задания потерялись. Начните заново.",
+                show_alert=True,
+            )
+            return
+
+        await state.update_data(duration_seconds=seconds)
+        await callback.answer()
+
+        if callback.message:
+            await show_task_confirm(callback.message, state)
+
+        return
+
+    if action == "task_send":
+        admin_id = callback.from_user.id
+
+        if admin_id in _TASK_SEND_LOCK:
+            await callback.answer(
+                "Задание уже создаётся.",
+                show_alert=True,
+            )
+            return
+
+        _TASK_SEND_LOCK.add(admin_id)
+
+        try:
+            data = await state.get_data()
+            prize = str(data.get("prize") or "").strip()
+            goal = str(data.get("goal") or "").strip()
+            invites = data.get("invites")
+            seconds = data.get("duration_seconds")
+
+            if (
+                not prize
+                or not goal
+                or not isinstance(invites, int)
+                or not isinstance(seconds, int)
+            ):
+                await callback.answer(
+                    "Данные задания потерялись. Начните заново.",
+                    show_alert=True,
+                )
+                return
+
+            deadline = datetime.now(timezone.utc).replace(microsecond=0)
+            deadline += timedelta(seconds=int(seconds))
+
+            try:
+                task_id = create_task(prize, goal, int(invites), deadline)
+            except Exception as error:
+                print(f"Задание не создано: {error}")
+                await callback.answer(
+                    "Не удалось создать задание.",
+                    show_alert=True,
+                )
+                return
+
+            await state.clear()
+            await callback.answer("Рассылка запущена.")
+
+            if callback.message:
+                await callback.message.answer(
+                    f"Задание #{task_id} создано. Рассылаю участникам.",
+                    reply_markup=admin_keyboard(),
+                )
+
+            spawn_job(broadcast_new_task(bot, task_id, admin_id))
+        finally:
+            _TASK_SEND_LOCK.discard(admin_id)
+
+        return
+
+    if action == "task":
+        if len(parts) < 3 or not parts[2].isdigit():
+            await callback.answer(
+                "Задание не найдено.",
+                show_alert=True,
+            )
+            return
+
+        task_id = int(parts[2])
+        page = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
+        task = get_task(task_id)
+
+        if not task:
+            await callback.answer(
+                "Задание не найдено.",
+                show_alert=True,
+            )
+            return
+
+        if str(task["status"]) == "active" and task_deadline_passed(task):
+            if claim_task_expired(task_id):
+                spawn_job(announce_task_result(bot, task_id, "expired"))
+
+        if not callback.message:
+            await callback.answer()
+            return
+
+        shown = await render_task_card(callback.message, task_id, page)
+
+        if shown:
+            await callback.answer()
+        else:
+            await callback.answer(
+                "Дальше участников нет." if page else "Задание не найдено.",
+                show_alert=True,
+            )
+
+        return
+
+    await callback.answer(
+        "Некорректный запрос.",
+        show_alert=True,
+    )
+
+
+@router.message(StateFilter(TaskForm.prize), F.text)
+async def task_form_prize(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    text = (message.text or "").strip()
+
+    if not text or text.startswith("/"):
+        await message.answer(
+            "Напишите приз обычным текстом или нажмите /cancel."
+        )
+        return
+
+    if len(text) > 300:
+        await message.answer("Приз слишком длинный. До 300 символов.")
+        return
+
+    await state.update_data(prize=text)
+    await state.set_state(TaskForm.goal)
+    await message.answer(
+        "Опишите цель розыгрыша: что получат участники и за что.\n\n"
+        "Отмена — /cancel"
+    )
+
+
+@router.message(StateFilter(TaskForm.goal), F.text)
+async def task_form_goal(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    text = (message.text or "").strip()
+
+    if not text or text.startswith("/"):
+        await message.answer(
+            "Нужно описание цели текстом или /cancel."
+        )
+        return
+
+    if len(text) > 1000:
+        await message.answer(
+            "Описание слишком длинное. До 1000 символов."
+        )
+        return
+
+    await state.update_data(goal=text)
+    await state.set_state(TaskForm.invites)
+    await message.answer(
+        "Сколько человек нужно пригласить?\n"
+        "Напишите только число."
+    )
+
+
+@router.message(StateFilter(TaskForm.invites), F.text)
+async def task_form_invites(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    text = (message.text or "").strip()
+
+    if not text.isdigit() or not 1 <= int(text) <= 100000:
+        await message.answer("Нужно число от 1 до 100000.")
+        return
+
+    await state.update_data(invites=int(text))
+    await state.set_state(TaskForm.duration)
+    await message.answer(
+        "Срок действия розыгрыша.\n"
+        "Нажмите кнопку или напишите, например: "
+        "12, 12 часов, 2 дня, 30 минут.",
+        reply_markup=task_duration_keyboard(),
+    )
+
+
+@router.message(StateFilter(TaskForm.duration), F.text)
+async def task_form_duration(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    text = (message.text or "").strip()
+
+    if text.startswith("/"):
+        await message.answer(
+            "Напишите срок или нажмите /cancel.",
+            reply_markup=task_duration_keyboard(),
+        )
+        return
+
+    seconds = parse_duration_seconds(text)
+
+    if seconds is None:
+        await message.answer(
+            "Не понял срок. Пример: 12 часов, 2 дня или 30 минут. "
+            "Минимум — 10 минут, максимум — 30 дней.",
+            reply_markup=task_duration_keyboard(),
+        )
+        return
+
+    await state.update_data(duration_seconds=seconds)
+    await show_task_confirm(message, state)
+
+
+@router.message(
+    StateFilter(
+        TaskForm.prize,
+        TaskForm.goal,
+        TaskForm.invites,
+        TaskForm.duration,
+    )
+)
+async def task_form_invalid(message: Message):
+    await message.answer(
+        "На этом шаге нужен текст. Отмена — /cancel."
+    )
+
+
+# ============================================================
 # АДМИНКА: ОСНОВНЫЕ CALLBACK
 # ============================================================
 
@@ -6135,6 +7744,18 @@ async def admin_callback(
 
     parts = callback.data.split(":")
     action = parts[1]
+
+    if action in {
+        "tasks",
+        "task",
+        "task_new",
+        "task_dur",
+        "task_send",
+        "task_drop",
+        "task_templates",
+    }:
+        await handle_task_admin(callback, state, bot, parts, action)
+        return
 
     if action == "menu":
         await callback.answer()
@@ -7438,6 +9059,20 @@ async def admin_message_select(
         hint += (
             "\n\nЭто сообщение уходит каждые 24 часа тем, "
             "кто сутки ничего не писал боту и не нажимал кнопки."
+        )
+    elif key.startswith("task_"):
+        hint += (
+            "\n\nШаблон розыгрыша. Бот сам подставляет:\n"
+            "{prize} — приз\n"
+            "{goal} — описание цели\n"
+            "{invites} — сколько людей нужно пригласить\n"
+            "{deadline} — срок по Москве\n"
+            "{link} — личная ссылка участника\n"
+            "{progress} — сколько уже пригласил\n"
+            "{left} — сколько осталось\n"
+            "{winner} — кликабельный победитель\n\n"
+            "Не вставляйте эти имена вручную в другие шаблоны: "
+            "они работают только в текстах задания."
         )
 
     await callback.message.answer(hint)
@@ -9067,16 +10702,19 @@ async def main():
     dispatcher = Dispatcher()
     dispatcher.include_router(router)
     reengage_task = asyncio.create_task(reengage_loop(bot))
+    tasks_watch = asyncio.create_task(tasks_watch_loop(bot))
 
     try:
         await dispatcher.start_polling(bot)
     finally:
         reengage_task.cancel()
+        tasks_watch.cancel()
 
-        try:
-            await reengage_task
-        except asyncio.CancelledError:
-            pass
+        for job in (reengage_task, tasks_watch):
+            try:
+                await job
+            except asyncio.CancelledError:
+                pass
 
         await bot.session.close()
         DB.close()
