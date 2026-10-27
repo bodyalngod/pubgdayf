@@ -22,7 +22,7 @@ from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from aiogram.filters import Command, StateFilter
+from aiogram.filters import Command, Filter, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -256,6 +256,10 @@ class ClanForm(StatesGroup):
     edit_leader = State()
 
 
+class ButtonForm(StatesGroup):
+    text = State()
+
+
 PROFILE_FIELDS = [
     "nickname",
     "gender",
@@ -487,6 +491,13 @@ def init_database() -> None:
             photo_file_id TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS menu_buttons (
+            button_key TEXT PRIMARY KEY,
+            label TEXT NOT NULL,
+            previous TEXT,
+            updated TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS required_channels (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             chat_id INTEGER,
@@ -716,6 +727,18 @@ def init_database() -> None:
     if message_columns and "photo_file_id" not in message_columns:
         DB.execute(
             "ALTER TABLE bot_messages ADD COLUMN photo_file_id TEXT"
+        )
+
+    button_columns = {
+        row["name"]
+        for row in DB.execute(
+            "PRAGMA table_info(menu_buttons)"
+        ).fetchall()
+    }
+
+    if button_columns and "previous" not in button_columns:
+        DB.execute(
+            "ALTER TABLE menu_buttons ADD COLUMN previous TEXT"
         )
 
     DB.commit()
@@ -2440,6 +2463,7 @@ ADMIN_STATE_PREFIXES = (
     "SuperAdminForm:",
     "TaskForm:",
     "ClanForm:",
+    "ButtonForm:",
 )
 
 
@@ -3337,45 +3361,334 @@ async def edit_or_send(
 # КЛАВИАТУРЫ
 # ============================================================
 
+MENU_BUTTON_DEFAULTS = {
+    "search": "🔍 Найти игрока",
+    "profile": "📝 Моя анкета",
+    "edit": "✏️ Создать / изменить анкету",
+    "delete": "🗑 Удалить мою анкету",
+    "clans": "Кланы",
+    "gender": "🚻 Поиск по полу",
+    "boost": "⬆️ Поднять в топ",
+    "premium": "Premium за приглашения",
+    "tiktok": "Заработай на тик-токах",
+    "help": "ℹ️ Помощь",
+}
+
+MENU_BUTTON_TITLES = {
+    "search": "Найти игрока",
+    "profile": "Моя анкета",
+    "edit": "Создать / изменить анкету",
+    "delete": "Удалить анкету",
+    "clans": "Кланы",
+    "gender": "Поиск по полу",
+    "boost": "Поднять в топ",
+    "premium": "Premium за приглашения",
+    "tiktok": "Заработай на тик-токах",
+    "help": "Помощь",
+}
+
+MENU_BUTTON_ORDER = (
+    "search",
+    "profile",
+    "edit",
+    "delete",
+    "clans",
+    "gender",
+    "boost",
+    "premium",
+    "tiktok",
+    "help",
+)
+
+BUTTON_LABEL_MAX = 64
+_MENU_LABEL_CACHE: dict[str, str] | None = None
+_MENU_HISTORY_CACHE: dict[str, tuple[str, ...]] | None = None
+
+
+def invalidate_menu_labels() -> None:
+    global _MENU_LABEL_CACHE, _MENU_HISTORY_CACHE
+    _MENU_LABEL_CACHE = None
+    _MENU_HISTORY_CACHE = None
+
+
+def _load_menu_button_rows() -> bool:
+    global _MENU_LABEL_CACHE, _MENU_HISTORY_CACHE
+
+    labels = dict(MENU_BUTTON_DEFAULTS)
+    history = {key: () for key in MENU_BUTTON_ORDER}
+
+    try:
+        rows = DB.execute(
+            """
+            SELECT button_key, label, previous
+            FROM menu_buttons
+            """
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return False
+
+    for row in rows:
+        key = str(row["button_key"] or "")
+        label = str(row["label"] or "").strip()
+
+        if key not in labels:
+            continue
+
+        if label:
+            labels[key] = label
+
+        previous = tuple(
+            item.strip()
+            for item in str(row["previous"] or "").split("\n")
+            if item.strip()
+        )
+        history[key] = previous
+
+    _MENU_LABEL_CACHE = labels
+    _MENU_HISTORY_CACHE = history
+    return True
+
+
+def menu_labels() -> dict[str, str]:
+    if _MENU_LABEL_CACHE is None and not _load_menu_button_rows():
+        return dict(MENU_BUTTON_DEFAULTS)
+
+    return _MENU_LABEL_CACHE or dict(MENU_BUTTON_DEFAULTS)
+
+
+def button_history(key: str) -> tuple[str, ...]:
+    if _MENU_HISTORY_CACHE is None and not _load_menu_button_rows():
+        return ()
+
+    if not _MENU_HISTORY_CACHE:
+        return ()
+
+    return _MENU_HISTORY_CACHE.get(key, ())
+
+
+def button_label(key: str) -> str:
+    return menu_labels().get(key) or MENU_BUTTON_DEFAULTS[key]
+
+
+def menu_button_key(text: str) -> str | None:
+    raw = (text or "").strip()
+
+    if not raw:
+        return None
+
+    labels = menu_labels()
+
+    for key in MENU_BUTTON_ORDER:
+        if raw == labels[key]:
+            return key
+
+    taken = set(labels.values())
+
+    for key in MENU_BUTTON_ORDER:
+        extras = (MENU_BUTTON_DEFAULTS[key], *button_history(key))
+
+        if raw in extras and raw not in taken:
+            return key
+
+    return None
+
+
+def normalize_button_label(value: str) -> str:
+    return " ".join(str(value or "").split())
+
+
+def button_label_units(value: str) -> int:
+    return len(value.encode("utf-16-le")) // 2
+
+
+def button_label_error(key: str, label: str) -> str | None:
+    if not label:
+        return "Пустой текст не подойдёт."
+
+    if label.startswith("/"):
+        return "Текст кнопки не должен начинаться со слэша."
+
+    if button_label_units(label) > BUTTON_LABEL_MAX:
+        return (
+            f"Слишком длинно. Максимум {BUTTON_LABEL_MAX} символов."
+        )
+
+    labels = menu_labels()
+
+    for other in MENU_BUTTON_ORDER:
+        if other == key:
+            continue
+
+        occupied = (
+            label == labels[other]
+            or label == MENU_BUTTON_DEFAULTS[other]
+            or label in button_history(other)
+        )
+
+        if occupied:
+            title = MENU_BUTTON_TITLES[other]
+            return f"Этот текст уже занят кнопкой «{title}»."
+
+    return None
+
+
+def save_button_label(key: str, label: str) -> None:
+    current = button_label(key)
+    history = [
+        item
+        for item in button_history(key)
+        if item and item != label and item != MENU_BUTTON_DEFAULTS[key]
+    ]
+
+    if (
+        current
+        and current != label
+        and current != MENU_BUTTON_DEFAULTS[key]
+        and current not in history
+    ):
+        history.append(current)
+
+    history = history[-30:]
+    previous = "\n".join(history)
+
+    try:
+        if label == MENU_BUTTON_DEFAULTS[key] and not history:
+            DB.execute(
+                "DELETE FROM menu_buttons WHERE button_key = ?",
+                (key,),
+            )
+        else:
+            DB.execute(
+                """
+                INSERT INTO menu_buttons (
+                    button_key,
+                    label,
+                    previous,
+                    updated
+                )
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(button_key) DO UPDATE SET
+                    label = excluded.label,
+                    previous = excluded.previous,
+                    updated = excluded.updated
+                """,
+                (key, label, previous or None, current_time()),
+            )
+        DB.commit()
+    except Exception:
+        DB.rollback()
+        raise
+
+    invalidate_menu_labels()
+
+
+class MenuButton(Filter):
+    def __init__(self, key: str):
+        self.key = key
+
+    async def __call__(
+        self,
+        message: Message,
+        state: FSMContext,
+    ) -> bool:
+        current = await state.get_state()
+
+        if current and str(current).startswith("ButtonForm:"):
+            return False
+
+        return menu_button_key(message.text or "") == self.key
+
+
+def buttons_admin_text() -> str:
+    lines = [
+        "<b>Кнопки</b>",
+        "",
+        "Текст кнопок главного меню. "
+        "Нажмите кнопку ниже и пришлите новую подпись.",
+        "Игроки увидят её, когда бот снова покажет меню. "
+        "Старая подпись тоже сработает, пока человек "
+        "не получит обновлённую клавиатуру.",
+        "«Удалить анкету» есть только у тех, кто создал анкету. "
+        "«Поиск по полу» и «Поднять в топ» — только с Premium.",
+        "",
+    ]
+
+    for key in MENU_BUTTON_ORDER:
+        title = html.escape(MENU_BUTTON_TITLES[key])
+        label = html.escape(button_label(key))
+        changed = button_label(key) != MENU_BUTTON_DEFAULTS[key]
+        mark = " · изменена" if changed else ""
+        lines.append(f"{title}: <code>{label}</code>{mark}")
+
+    return "\n".join(lines)
+
+
+def buttons_admin_keyboard() -> InlineKeyboardMarkup:
+    buttons = []
+
+    for key in MENU_BUTTON_ORDER:
+        title = MENU_BUTTON_TITLES[key]
+        label = button_label(key)
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{title}: {label}"[:64],
+                    callback_data=f"admin:btn:{key}",
+                )
+            ]
+        )
+
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text="⬅️ В админ-панель",
+                callback_data="admin:menu",
+            )
+        ]
+    )
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
 def main_keyboard(
     has_profile: bool = False,
     premium: bool = False,
 ) -> ReplyKeyboardMarkup:
     rows = [
         [
-            KeyboardButton(text="🔍 Найти игрока"),
-            KeyboardButton(text="📝 Моя анкета"),
+            KeyboardButton(text=button_label("search")),
+            KeyboardButton(text=button_label("profile")),
         ],
         [
-            KeyboardButton(text="✏️ Создать / изменить анкету"),
+            KeyboardButton(text=button_label("edit")),
         ],
     ]
 
     if has_profile:
         rows.append(
-            [KeyboardButton(text="🗑 Удалить мою анкету")]
+            [KeyboardButton(text=button_label("delete"))]
         )
 
     rows.append(
-        [KeyboardButton(text="Кланы")]
+        [KeyboardButton(text=button_label("clans"))]
     )
 
     if premium:
         rows.append(
-            [KeyboardButton(text="🚻 Поиск по полу")]
+            [KeyboardButton(text=button_label("gender"))]
         )
         rows.append(
-            [KeyboardButton(text="⬆️ Поднять в топ")]
+            [KeyboardButton(text=button_label("boost"))]
         )
 
     rows.append(
-        [KeyboardButton(text="Premium за приглашения")]
+        [KeyboardButton(text=button_label("premium"))]
     )
     rows.append(
-        [KeyboardButton(text="Заработай на тик-токах")]
+        [KeyboardButton(text=button_label("tiktok"))]
     )
     rows.append(
-        [KeyboardButton(text="ℹ️ Помощь")]
+        [KeyboardButton(text=button_label("help"))]
     )
 
     return ReplyKeyboardMarkup(
@@ -3418,6 +3731,10 @@ def admin_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="💬 Шаблоны",
                     callback_data="admin:messages",
+                ),
+                InlineKeyboardButton(
+                    text="Кнопки",
+                    callback_data="admin:buttons",
                 ),
             ],
             [
@@ -4953,52 +5270,54 @@ async def problem_menu_instead(
     text: str,
 ) -> bool:
     """Кнопка меню во время описания проблемы не должна стать текстом жалобы."""
-    if text == "📝 Моя анкета":
+    key = menu_button_key(text)
+
+    if key == "profile":
         await state.clear()
         await command_profile(message)
         return True
 
-    if text == "ℹ️ Помощь":
+    if key == "help":
         await state.clear()
         await command_help(message)
         return True
 
-    if text == "🔍 Найти игрока":
+    if key == "search":
         await state.clear()
         await command_search(message)
         return True
 
-    if text == "Premium за приглашения":
+    if key == "premium":
         await state.clear()
         await command_prem(message, message.bot)
         return True
 
-    if text == "Заработай на тик-токах":
+    if key == "tiktok":
         await state.clear()
         await menu_tiktok(message)
         return True
 
-    if text == "🚻 Поиск по полу":
+    if key == "gender":
         await state.clear()
         await menu_search_gender(message)
         return True
 
-    if text == "⬆️ Поднять в топ":
+    if key == "boost":
         await state.clear()
         await menu_boost(message)
         return True
 
-    if text == "✏️ Создать / изменить анкету":
+    if key == "edit":
         await state.clear()
         await start_profile_form(message, state)
         return True
 
-    if text == "Кланы":
+    if key == "clans":
         await state.clear()
         await show_clans_menu(message)
         return True
 
-    if text == "🗑 Удалить мою анкету":
+    if key == "delete":
         await state.clear()
         await delete_my_profile_request(message)
         return True
@@ -5059,20 +5378,22 @@ async def problem_report_invalid(message: Message):
     )
 
 
-@router.message(F.text == "📝 Моя анкета")
+@router.message(MenuButton("profile"))
 async def menu_profile(message: Message):
     await command_profile(message)
 
 
-@router.message(F.text == "ℹ️ Помощь")
+@router.message(MenuButton("help"))
 async def menu_help(message: Message):
     await command_help(message)
-@router.message(F.text == "🔍 Найти игрока")
+
+
+@router.message(MenuButton("search"))
 async def menu_search(message: Message):
     await command_search(message)
 
 
-@router.message(F.text == "Premium за приглашения")
+@router.message(MenuButton("premium"))
 async def menu_prem(message: Message, bot: Bot):
     await command_prem(message, bot)
 
@@ -5090,7 +5411,7 @@ def tiktok_submit_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-@router.message(F.text == "Заработай на тик-токах")
+@router.message(MenuButton("tiktok"))
 async def menu_tiktok(message: Message):
     await send_template(
         message,
@@ -5099,7 +5420,7 @@ async def menu_tiktok(message: Message):
     )
 
 
-@router.message(F.text == "🚻 Поиск по полу")
+@router.message(MenuButton("gender"))
 async def menu_search_gender(message: Message):
     user_id = message.from_user.id
 
@@ -5117,14 +5438,15 @@ async def menu_search_gender(message: Message):
         )
         return
 
+    search_label = html.escape(button_label("search"))
     await message.answer(
         "Кого искать?\n"
-        "«🔍 Найти игрока» снова показывает всех.",
+        f"«{search_label}» снова показывает всех.",
         reply_markup=gender_search_keyboard(),
     )
 
 
-@router.message(F.text == "⬆️ Поднять в топ")
+@router.message(MenuButton("boost"))
 async def menu_boost(message: Message):
     user_id = message.from_user.id
     ok, text = try_boost_profile(user_id)
@@ -5135,7 +5457,7 @@ async def menu_boost(message: Message):
     )
 
 
-@router.message(F.text == "✏️ Создать / изменить анкету")
+@router.message(MenuButton("edit"))
 async def menu_edit_profile(
     message: Message,
     state: FSMContext,
@@ -5143,7 +5465,7 @@ async def menu_edit_profile(
     await start_profile_form(message, state)
 
 
-@router.message(F.text == "Кланы")
+@router.message(MenuButton("clans"))
 async def menu_clans(message: Message, state: FSMContext):
     await state.clear()
     await show_clans_menu(message)
@@ -5167,7 +5489,7 @@ async def show_clans_menu(message: Message) -> None:
 # УДАЛЕНИЕ СОБСТВЕННОЙ АНКЕТЫ
 # ============================================================
 
-@router.message(F.text == "🗑 Удалить мою анкету")
+@router.message(MenuButton("delete"))
 async def delete_my_profile_request(message: Message):
     if not get_profile(message.from_user.id):
         await message.answer(
@@ -5182,6 +5504,109 @@ async def delete_my_profile_request(message: Message):
         reply_markup=delete_confirmation_keyboard(
             message.from_user.id
         ),
+    )
+
+
+@router.message(StateFilter(ButtonForm.text), F.text)
+async def admin_button_text(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    data = await state.get_data()
+    key = str(data.get("button_key") or "")
+
+    if key not in MENU_BUTTON_DEFAULTS:
+        await state.clear()
+        await message.answer(
+            "Сессия сброшена. Откройте раздел «Кнопки» ещё раз.",
+            reply_markup=keyboard_for(message.from_user.id),
+        )
+        return
+
+    raw = message.text or ""
+    command = raw.strip().split(maxsplit=1)[0].split("@", 1)[0].casefold()
+
+    if command == "/reset":
+        default_label = MENU_BUTTON_DEFAULTS[key]
+        error = button_label_error(key, default_label)
+
+        if error:
+            await message.answer(error, parse_mode=None)
+            return
+
+        try:
+            save_button_label(key, default_label)
+        except Exception as error:
+            print(f"Кнопка {key}: {error}")
+            await message.answer(
+                "Не удалось вернуть текст. Попробуйте ещё раз.",
+                parse_mode=None,
+            )
+            return
+
+        await state.clear()
+        await message.answer(
+            "Текст по умолчанию восстановлен.",
+            reply_markup=keyboard_for(message.from_user.id),
+        )
+        await message.answer(
+            buttons_admin_text(),
+            reply_markup=buttons_admin_keyboard(),
+        )
+        return
+
+    if command.startswith("/"):
+        await message.answer(
+            "Пришлите текст кнопки, /reset или /cancel."
+        )
+        return
+
+    label = normalize_button_label(raw)
+    error = button_label_error(key, label)
+
+    if error:
+        await message.answer(error, parse_mode=None)
+        return
+
+    if label == button_label(key):
+        await state.clear()
+        await message.answer(
+            "Текст не изменился.",
+            reply_markup=keyboard_for(message.from_user.id),
+        )
+        await message.answer(
+            buttons_admin_text(),
+            reply_markup=buttons_admin_keyboard(),
+        )
+        return
+
+    try:
+        save_button_label(key, label)
+    except Exception as error:
+        print(f"Кнопка {key}: {error}")
+        await message.answer(
+            "Не удалось сохранить текст. Попробуйте ещё раз.",
+            parse_mode=None,
+        )
+        return
+
+    await state.clear()
+    await message.answer(
+        "Кнопка обновлена: "
+        f"<code>{html.escape(label)}</code>",
+        reply_markup=keyboard_for(message.from_user.id),
+    )
+    await message.answer(
+        buttons_admin_text(),
+        reply_markup=buttons_admin_keyboard(),
+    )
+
+
+@router.message(StateFilter(ButtonForm.text))
+async def admin_button_invalid(message: Message):
+    await message.answer(
+        "Пришлите новый текст кнопки, /reset или /cancel."
     )
 
 
@@ -10450,6 +10875,49 @@ async def admin_callback(
                 ]
             ),
         )
+        return
+
+    if action == "buttons":
+        await state.clear()
+        await callback.answer()
+
+        if callback.message:
+            await edit_or_send(
+                callback.message,
+                buttons_admin_text(),
+                buttons_admin_keyboard(),
+            )
+
+        return
+
+    if action == "btn":
+        key = parts[2] if len(parts) > 2 else ""
+
+        if key not in MENU_BUTTON_DEFAULTS:
+            await callback.answer(
+                "Кнопка не найдена.",
+                show_alert=True,
+            )
+            return
+
+        await state.set_state(ButtonForm.text)
+        await state.update_data(button_key=key)
+        await callback.answer()
+
+        if callback.message:
+            title = html.escape(MENU_BUTTON_TITLES[key])
+            current = html.escape(button_label(key))
+            default = html.escape(MENU_BUTTON_DEFAULTS[key])
+            await callback.message.answer(
+                f"<b>{title}</b>\n"
+                f"Сейчас: <code>{current}</code>\n"
+                f"По умолчанию: <code>{default}</code>\n\n"
+                "Пришлите новый текст кнопки.\n"
+                f"Одна строка, до {BUTTON_LABEL_MAX} символов.\n\n"
+                "/reset — вернуть текст по умолчанию\n"
+                "/cancel — отмена"
+            )
+
         return
 
     if action == "messages":
