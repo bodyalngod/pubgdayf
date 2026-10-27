@@ -3349,15 +3349,16 @@ def main_keyboard(
         [
             KeyboardButton(text="✏️ Создать / изменить анкету"),
         ],
-        [
-            KeyboardButton(text="Кланы"),
-        ],
     ]
 
     if has_profile:
         rows.append(
             [KeyboardButton(text="🗑 Удалить мою анкету")]
         )
+
+    rows.append(
+        [KeyboardButton(text="Кланы")]
+    )
 
     if premium:
         rows.append(
