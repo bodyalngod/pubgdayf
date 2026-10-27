@@ -245,6 +245,17 @@ class TaskForm(StatesGroup):
     duration = State()
 
 
+class ClanForm(StatesGroup):
+    name = State()
+    description = State()
+    photo = State()
+    leader = State()
+    edit_name = State()
+    edit_description = State()
+    edit_photo = State()
+    edit_leader = State()
+
+
 PROFILE_FIELDS = [
     "nickname",
     "gender",
@@ -607,6 +618,31 @@ def init_database() -> None:
             referrer_id INTEGER NOT NULL,
             created TEXT NOT NULL,
             PRIMARY KEY (task_id, referred_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS clans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL,
+            photo_file_id TEXT,
+            leader_username TEXT NOT NULL,
+            pinned INTEGER NOT NULL DEFAULT 0,
+            pin_rank INTEGER NOT NULL DEFAULT 0,
+            created TEXT NOT NULL,
+            updated TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS mutual_likes (
+            user_low INTEGER NOT NULL,
+            user_high INTEGER NOT NULL,
+            low_liked_at TEXT NOT NULL,
+            high_liked_at TEXT NOT NULL,
+            mutual_at TEXT NOT NULL,
+            low_nickname TEXT,
+            high_nickname TEXT,
+            low_username TEXT,
+            high_username TEXT,
+            PRIMARY KEY (user_low, user_high)
         );
         """
     )
@@ -2403,6 +2439,7 @@ ADMIN_STATE_PREFIXES = (
     "PremiumAdminForm:",
     "SuperAdminForm:",
     "TaskForm:",
+    "ClanForm:",
 )
 
 
@@ -2976,6 +3013,12 @@ DEFAULT_MESSAGES = {
         "Цель: {goal}\n"
         "Нужно было пригласить: {invites}"
     ),
+    "clans_intro": (
+        "Здесь ты можешь вступить в один из дружелюбных кланов "
+        "на свой выбор из списка ниже!"
+    ),
+    "clans_empty": "Кланы скоро появятся",
+    "clans_join": "Вступить в клан",
 }
 
 
@@ -3306,6 +3349,9 @@ def main_keyboard(
         [
             KeyboardButton(text="✏️ Создать / изменить анкету"),
         ],
+        [
+            KeyboardButton(text="Кланы"),
+        ],
     ]
 
     if has_profile:
@@ -3371,6 +3417,12 @@ def admin_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="💬 Шаблоны",
                     callback_data="admin:messages",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Управление кланами",
+                    callback_data="admin:clans",
                 ),
             ],
             [
@@ -4099,6 +4151,15 @@ def admin_messages_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(
                 text="Задание",
                 callback_data="admin:task_templates",
+            )
+        ]
+    )
+
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text="Кланы",
+                callback_data="admin:clan_templates",
             )
         ]
     )
@@ -4931,6 +4992,11 @@ async def problem_menu_instead(
         await start_profile_form(message, state)
         return True
 
+    if text == "Кланы":
+        await state.clear()
+        await show_clans_menu(message)
+        return True
+
     if text == "🗑 Удалить мою анкету":
         await state.clear()
         await delete_my_profile_request(message)
@@ -5074,6 +5140,26 @@ async def menu_edit_profile(
     state: FSMContext,
 ):
     await start_profile_form(message, state)
+
+
+@router.message(F.text == "Кланы")
+async def menu_clans(message: Message, state: FSMContext):
+    await state.clear()
+    await show_clans_menu(message)
+
+
+async def show_clans_menu(message: Message) -> None:
+    rows = list_clans()
+
+    if not rows:
+        await send_template(message, "clans_empty")
+        return
+
+    await send_template(
+        message,
+        "clans_intro",
+        clans_public_keyboard(rows),
+    )
 
 
 # ============================================================
@@ -6114,6 +6200,7 @@ async def process_likeback(
         ).fetchone()
 
         if mutual:
+            remember_mutual_like(user_id, liker_id)
             await callback.answer(
                 "🎉 Взаимный лайк!",
                 show_alert=True,
@@ -6239,6 +6326,7 @@ async def process_swipe(
         ).fetchone()
 
         if mutual:
+            remember_mutual_like(user_id, target_id)
             await callback.answer(
                 "🎉 Взаимный лайк!",
                 show_alert=True,
@@ -7726,6 +7814,1527 @@ async def task_form_invalid(message: Message):
 
 
 # ============================================================
+# КЛАНЫ И ЛОГ ВЗАИМНЫХ ЛАЙКОВ
+# ============================================================
+
+CLAN_MESSAGE_NAMES = {
+    "clans_intro": "Список кланов",
+    "clans_empty": "Кланов ещё нет",
+    "clans_join": "Кнопка «Вступить в клан»",
+}
+
+_LEADER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{4,31}$")
+
+
+def one_line(value, limit: int) -> str:
+    text = " ".join(str(value or "").split())
+
+    if len(text) <= limit:
+        return text
+
+    if limit <= 1:
+        return text[:limit]
+
+    return text[: limit - 1] + "…"
+
+
+def list_clans():
+    """Закреплённые сверху: новый закреп выше старого.
+
+    Остальные — по добавлению, первый добавленный выше.
+    """
+    try:
+        return DB.execute(
+            """
+            SELECT *
+            FROM clans
+            ORDER BY
+                pinned DESC,
+                CASE WHEN pinned = 1 THEN pin_rank ELSE 0 END DESC,
+                id ASC
+            """
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+
+def get_clan(clan_id: int):
+    try:
+        return DB.execute(
+            """
+            SELECT *
+            FROM clans
+            WHERE id = ?
+            """,
+            (clan_id,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+
+
+def create_clan(
+    name: str,
+    description: str,
+    photo_file_id: str | None,
+    leader_username: str,
+) -> int:
+    now = current_time()
+    cursor = DB.execute(
+        """
+        INSERT INTO clans (
+            name,
+            description,
+            photo_file_id,
+            leader_username,
+            pinned,
+            pin_rank,
+            created,
+            updated
+        )
+        VALUES (?, ?, ?, ?, 0, 0, ?, ?)
+        """,
+        (
+            name,
+            description,
+            photo_file_id,
+            leader_username,
+            now,
+            now,
+        ),
+    )
+    DB.commit()
+    return int(cursor.lastrowid)
+
+
+def update_clan_fields(clan_id: int, **fields) -> None:
+    allowed = {
+        "name",
+        "description",
+        "photo_file_id",
+        "leader_username",
+    }
+    keys = [key for key in fields if key in allowed]
+
+    if not keys:
+        return
+
+    assignments = ", ".join(f"{key} = ?" for key in keys)
+    values = [fields[key] for key in keys]
+    values.append(current_time())
+    values.append(clan_id)
+    DB.execute(
+        f"""
+        UPDATE clans
+        SET {assignments}, updated = ?
+        WHERE id = ?
+        """,
+        values,
+    )
+    DB.commit()
+
+
+def set_clan_pinned(clan_id: int, pinned: bool) -> None:
+    if pinned:
+        row = DB.execute(
+            """
+            SELECT COALESCE(MAX(pin_rank), 0) + 1 AS rank
+            FROM clans
+            """
+        ).fetchone()
+        DB.execute(
+            """
+            UPDATE clans
+            SET pinned = 1,
+                pin_rank = ?,
+                updated = ?
+            WHERE id = ?
+            """,
+            (int(row["rank"]), current_time(), clan_id),
+        )
+    else:
+        DB.execute(
+            """
+            UPDATE clans
+            SET pinned = 0,
+                updated = ?
+            WHERE id = ?
+            """,
+            (current_time(), clan_id),
+        )
+
+    DB.commit()
+
+
+def delete_clan(clan_id: int) -> None:
+    DB.execute(
+        "DELETE FROM clans WHERE id = ?",
+        (clan_id,),
+    )
+    DB.commit()
+
+
+def normalize_leader_username(value: str) -> str | None:
+    raw = (value or "").strip().split()[0] if (value or "").strip() else ""
+    raw = raw.split("?")[0].rstrip("/")
+
+    for prefix in (
+        "https://t.me/",
+        "http://t.me/",
+        "https://telegram.me/",
+        "http://telegram.me/",
+        "t.me/",
+        "telegram.me/",
+    ):
+        if raw.casefold().startswith(prefix):
+            raw = raw[len(prefix):]
+            break
+
+    raw = raw.split("/")[0]
+
+    if raw.startswith("@"):
+        raw = raw[1:]
+
+    if not _LEADER_RE.fullmatch(raw):
+        return None
+
+    return raw
+
+
+def clan_join_label() -> str:
+    label = one_line(get_message_text("clans_join"), 64)
+    return label or "Вступить в клан"
+
+
+def clans_public_keyboard(rows) -> InlineKeyboardMarkup:
+    buttons = []
+
+    for row in rows[:100]:
+        title = one_line(row["name"], 64) or "Клан"
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text=title,
+                    callback_data=f"clan:open:{int(row['id'])}",
+                )
+            ]
+        )
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def clans_admin_text(rows) -> str:
+    lines = [
+        "<b>Управление кланами</b>",
+        "",
+        "Игроки видят кланы в этом порядке.",
+        "Первый добавленный стоит выше следующих.",
+        "Закреплённый клан поднимается над незакреплёнными.",
+        "Каждый новый закреп становится выше предыдущего.",
+        "",
+        f"Сейчас кланов: {len(rows)}.",
+    ]
+
+    if not rows:
+        lines.append(
+            "Пока пусто. В кнопке «Кланы» написано, "
+            "что кланы скоро появятся."
+        )
+
+    return "\n".join(lines)
+
+
+def clans_admin_keyboard(rows) -> InlineKeyboardMarkup:
+    buttons = [
+        [
+            InlineKeyboardButton(
+                text="➕ Добавить клан",
+                callback_data="admin:clan_new",
+            )
+        ]
+    ]
+
+    for row in rows[:100]:
+        mark = "📌 " if int(row["pinned"] or 0) else ""
+        title = one_line(row["name"], 60) or "Клан"
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{mark}{title}"[:64],
+                    callback_data=f"admin:clan:{int(row['id'])}",
+                )
+            ]
+        )
+
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text="⬅️ В админ-панель",
+                callback_data="admin:menu",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def clan_admin_keyboard(clan) -> InlineKeyboardMarkup:
+    clan_id = int(clan["id"])
+    buttons = [
+        [
+            InlineKeyboardButton(
+                text="Изменить название",
+                callback_data=f"admin:clan_name:{clan_id}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="Изменить описание",
+                callback_data=f"admin:clan_desc:{clan_id}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="Изменить картинку",
+                callback_data=f"admin:clan_photo:{clan_id}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="Изменить лидера",
+                callback_data=f"admin:clan_leader:{clan_id}",
+            )
+        ],
+    ]
+
+    if int(clan["pinned"] or 0):
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text="📌 Закрепить выше",
+                    callback_data=f"admin:clan_pin:{clan_id}",
+                )
+            ]
+        )
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text="Открепить",
+                    callback_data=f"admin:clan_unpin:{clan_id}",
+                )
+            ]
+        )
+    else:
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text="📌 Закрепить",
+                    callback_data=f"admin:clan_pin:{clan_id}",
+                )
+            ]
+        )
+
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text="🗑 Удалить",
+                callback_data=f"admin:clan_del:{clan_id}",
+            )
+        ]
+    )
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text="⬅️ К кланам",
+                callback_data="admin:clans",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def clan_admin_text(clan) -> str:
+    pinned = int(clan["pinned"] or 0)
+    status = (
+        "закреплён над незакреплёнными"
+        if pinned
+        else "обычный порядок добавления"
+    )
+    has_photo = stored_media(clan["photo_file_id"])[1] is not None
+    name = html.escape(str(clan["name"] or "Клан"))
+    leader = html.escape(str(clan["leader_username"] or ""))
+    description = html.escape(str(clan["description"] or "").strip())
+    text = (
+        f"<b>{name}</b>\n"
+        f"Статус: {status}\n"
+        f"Лидер: @{leader}\n"
+        f"Картинка: {'есть' if has_photo else 'нет'}\n"
+        f"Добавлен: {html.escape(format_msk(clan['created']))}\n\n"
+        f"{description}"
+    )
+
+    if len(text) > 4000:
+        text = text[:3999] + "…"
+
+    return text
+
+
+def clan_public_text(clan) -> str:
+    name = html.escape(str(clan["name"] or "Клан"))
+    description = html.escape(str(clan["description"] or "").strip())
+    text = f"<b>{name}</b>\n\n{description}"
+
+    if len(text) > 4000:
+        text = text[:3999] + "…"
+
+    return text
+
+
+def clan_join_keyboard(clan) -> InlineKeyboardMarkup:
+    username = str(clan["leader_username"] or "").strip().lstrip("@")
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=clan_join_label(),
+                    url=f"https://t.me/{username}",
+                )
+            ]
+        ]
+    )
+
+
+async def send_rich_card(
+    message: Message,
+    text: str,
+    photo_value,
+    reply_markup=None,
+) -> None:
+    kind, file_id = stored_media(photo_value)
+
+    if file_id and len(text) <= 1024:
+        try:
+            if kind == "document":
+                await message.answer_document(
+                    document=file_id,
+                    caption=text,
+                    reply_markup=reply_markup,
+                )
+            else:
+                await message.answer_photo(
+                    photo=file_id,
+                    caption=text,
+                    reply_markup=reply_markup,
+                )
+            return
+        except Exception as error:
+            print(f"Карточка с картинкой: {error}")
+
+    if file_id:
+        try:
+            if kind == "document":
+                await message.answer_document(document=file_id)
+            else:
+                await message.answer_photo(photo=file_id)
+        except Exception as error:
+            print(f"Картинка карточки: {error}")
+            text += "\n\n⚠️ Картинка недоступна."
+
+    await answer_text(message, text, reply_markup)
+
+
+async def present_clans(message: Message) -> None:
+    rows = list_clans()
+    await edit_or_send(
+        message,
+        clans_admin_text(rows),
+        clans_admin_keyboard(rows),
+    )
+
+
+async def present_clan_admin(message: Message, clan) -> None:
+    await send_rich_card(
+        message,
+        clan_admin_text(clan),
+        clan["photo_file_id"],
+        clan_admin_keyboard(clan),
+    )
+
+
+async def replace_with_clan_card(message: Message, clan) -> None:
+    try:
+        await message.delete()
+    except Exception as error:
+        print(f"Сообщение клана {clan['id']}: {error}")
+
+    await present_clan_admin(message, clan)
+
+
+def clan_messages_keyboard() -> InlineKeyboardMarkup:
+    buttons = [
+        [
+            InlineKeyboardButton(
+                text=title,
+                callback_data=f"admin_message:{key}",
+            )
+        ]
+        for key, title in CLAN_MESSAGE_NAMES.items()
+    ]
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text="⬅️ К шаблонам",
+                callback_data="admin:messages",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def clan_id_from_parts(parts: list[str]) -> int | None:
+    if len(parts) < 3 or not parts[2].isdigit():
+        return None
+
+    clan_id = int(parts[2])
+
+    if clan_id <= 0:
+        return None
+
+    return clan_id
+
+
+def plain_command(text: str) -> str:
+    raw = (text or "").strip().split(maxsplit=1)[0]
+    return raw.split("@", 1)[0].casefold()
+
+
+async def handle_clan_admin(
+    callback: CallbackQuery,
+    state: FSMContext,
+    parts: list[str],
+    action: str,
+) -> None:
+    if action == "clans":
+        await state.clear()
+        await callback.answer()
+
+        if callback.message:
+            await present_clans(callback.message)
+
+        return
+
+    if action == "clan_templates":
+        await callback.answer()
+
+        if callback.message:
+            await edit_or_send(
+                callback.message,
+                "<b>Шаблоны кланов</b>\n\n"
+                "Тексты раздела «Кланы».\n"
+                "Название, описание и картинка каждого клана "
+                "меняются в «Управление кланами», не здесь.",
+                clan_messages_keyboard(),
+            )
+
+        return
+
+    if action == "clan_new":
+        await state.clear()
+        await state.set_state(ClanForm.name)
+        await callback.answer()
+
+        if callback.message:
+            await callback.message.answer(
+                "Новый клан.\n\n"
+                "Напишите название. Оно станет кнопкой "
+                "в разделе «Кланы».\n"
+                "До 64 символов.\n\n"
+                "Отмена — /cancel"
+            )
+
+        return
+
+    if action in {"clan_name", "clan_desc", "clan_photo", "clan_leader"}:
+        clan_id = clan_id_from_parts(parts)
+        clan = get_clan(clan_id) if clan_id else None
+
+        if not clan:
+            await callback.answer("Клан не найден.", show_alert=True)
+            return
+
+        await callback.answer()
+
+        if not callback.message:
+            return
+
+        if action == "clan_name":
+            await state.set_state(ClanForm.edit_name)
+            await state.update_data(clan_id=clan_id)
+            await callback.message.answer(
+                "Новое название клана.\n"
+                "До 64 символов.\n\n"
+                "Отмена — /cancel"
+            )
+            return
+
+        if action == "clan_desc":
+            await state.set_state(ClanForm.edit_description)
+            await state.update_data(clan_id=clan_id)
+            await callback.message.answer(
+                "Новое описание клана.\n"
+                "Его увидят игроки вместе с картинкой.\n\n"
+                "Отмена — /cancel"
+            )
+            return
+
+        if action == "clan_photo":
+            await state.set_state(ClanForm.edit_photo)
+            await state.update_data(clan_id=clan_id)
+            await callback.message.answer(
+                "Пришлите новую картинку клана.\n"
+                "/delete_photo — убрать картинку.\n"
+                "/skip — оставить текущую.\n\n"
+                "Отмена — /cancel"
+            )
+            return
+
+        await state.set_state(ClanForm.edit_leader)
+        await state.update_data(clan_id=clan_id)
+        await callback.message.answer(
+            "Юзернейм лидера.\n"
+            "Кнопка «Вступить в клан» откроет чат с ним.\n"
+            "Пример: @nickname\n\n"
+            "Отмена — /cancel"
+        )
+        return
+
+    if action in {"clan", "clan_pin", "clan_unpin", "clan_del", "clan_del_yes"}:
+        clan_id = clan_id_from_parts(parts)
+        clan = get_clan(clan_id) if clan_id else None
+
+        if action != "clan_del_yes" and not clan:
+            await callback.answer("Клан не найден.", show_alert=True)
+            return
+
+        if action == "clan_pin":
+            set_clan_pinned(clan_id, True)
+            await callback.answer("Клан закреплён выше.")
+            clan = get_clan(clan_id)
+
+            if callback.message and clan:
+                await replace_with_clan_card(callback.message, clan)
+
+            return
+
+        if action == "clan_unpin":
+            set_clan_pinned(clan_id, False)
+            await callback.answer("Клан откреплён.")
+            clan = get_clan(clan_id)
+
+            if callback.message and clan:
+                await replace_with_clan_card(callback.message, clan)
+
+            return
+
+        if action == "clan_del":
+            await callback.answer()
+
+            if callback.message:
+                name = html.escape(str(clan["name"] or "клан"))
+                await edit_or_send(
+                    callback.message,
+                    f"Удалить клан «{name}»?",
+                    InlineKeyboardMarkup(
+                        inline_keyboard=[
+                            [
+                                InlineKeyboardButton(
+                                    text="Да, удалить",
+                                    callback_data=(
+                                        f"admin:clan_del_yes:{clan_id}"
+                                    ),
+                                ),
+                                InlineKeyboardButton(
+                                    text="Отмена",
+                                    callback_data=f"admin:clan:{clan_id}",
+                                ),
+                            ]
+                        ]
+                    ),
+                )
+
+            return
+
+        if action == "clan_del_yes":
+            if not clan:
+                await callback.answer("Клан уже удалён.", show_alert=True)
+
+                if callback.message:
+                    await present_clans(callback.message)
+
+                return
+
+            delete_clan(clan_id)
+            await state.clear()
+            await callback.answer("Клан удалён.")
+
+            if callback.message:
+                await present_clans(callback.message)
+
+            return
+
+        await callback.answer()
+
+        if callback.message and clan:
+            await replace_with_clan_card(callback.message, clan)
+
+        return
+
+    await callback.answer("Некорректный запрос.", show_alert=True)
+
+
+async def finish_clan_edit(
+    message: Message,
+    state: FSMContext,
+    clan_id: int,
+    notice: str,
+) -> None:
+    await state.clear()
+    clan = get_clan(clan_id)
+
+    if not clan:
+        await message.answer("Клан уже удалён.")
+        return
+
+    await message.answer(notice)
+    await present_clan_admin(message, clan)
+
+
+@router.message(StateFilter(ClanForm.name), F.text)
+async def clan_form_name(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    text = one_line(message.text, 80)
+
+    if not text or text.startswith("/"):
+        await message.answer(
+            "Напишите название текстом или нажмите /cancel."
+        )
+        return
+
+    if len(text) > 64:
+        await message.answer("Название длиннее 64 символов. Сократите его.")
+        return
+
+    await state.update_data(name=text)
+    await state.set_state(ClanForm.description)
+    await message.answer(
+        "Опишите клан. Этот текст откроется вместе с картинкой.\n\n"
+        "Отмена — /cancel"
+    )
+
+
+@router.message(StateFilter(ClanForm.description), F.text)
+async def clan_form_description(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    text = (message.text or "").strip()
+
+    if not text or text.startswith("/"):
+        await message.answer(
+            "Нужно описание текстом или /cancel."
+        )
+        return
+
+    if len(text) > 3500:
+        await message.answer("Описание длиннее 3500 символов. Сократите его.")
+        return
+
+    await state.update_data(description=text)
+    await state.set_state(ClanForm.photo)
+    await message.answer(
+        "Пришлите картинку клана.\n"
+        "/skip — пока без картинки.\n\n"
+        "Отмена — /cancel"
+    )
+
+
+@router.message(StateFilter(ClanForm.photo), F.photo)
+@router.message(StateFilter(ClanForm.photo), F.document)
+@router.message(StateFilter(ClanForm.edit_photo), F.photo)
+@router.message(StateFilter(ClanForm.edit_photo), F.document)
+async def clan_form_photo(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    photo_file_id = template_media_id(message)
+
+    if not photo_file_id:
+        await message.answer(
+            "Нужна картинка: обычное фото или файл-изображение."
+        )
+        return
+
+    current = await state.get_state()
+
+    if current == ClanForm.edit_photo.state:
+        data = await state.get_data()
+        clan_id = int(data.get("clan_id") or 0)
+        clan = get_clan(clan_id)
+
+        if not clan:
+            await state.clear()
+            await message.answer("Клан уже удалён.")
+            return
+
+        update_clan_fields(clan_id, photo_file_id=photo_file_id)
+        await finish_clan_edit(message, state, clan_id, "Картинка обновлена.")
+        return
+
+    await state.update_data(photo_file_id=photo_file_id)
+    await state.set_state(ClanForm.leader)
+    await message.answer(
+        "Юзернейм лидера клана.\n"
+        "По кнопке «Вступить в клан» откроется личный чат с ним.\n"
+        "Пример: @nickname\n\n"
+        "Отмена — /cancel"
+    )
+
+
+@router.message(StateFilter(ClanForm.photo), F.text)
+@router.message(StateFilter(ClanForm.edit_photo), F.text)
+async def clan_form_photo_text(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    command = plain_command(message.text or "")
+    current = await state.get_state()
+
+    if current == ClanForm.edit_photo.state:
+        data = await state.get_data()
+        clan_id = int(data.get("clan_id") or 0)
+
+        if command == "/skip":
+            await finish_clan_edit(
+                message,
+                state,
+                clan_id,
+                "Картинка осталась прежней.",
+            )
+            return
+
+        if command == "/delete_photo":
+            clan = get_clan(clan_id)
+
+            if not clan:
+                await state.clear()
+                await message.answer("Клан уже удалён.")
+                return
+
+            update_clan_fields(clan_id, photo_file_id=None)
+            await finish_clan_edit(message, state, clan_id, "Картинка убрана.")
+            return
+
+        await message.answer(
+            "Пришлите картинку, /skip, /delete_photo или /cancel."
+        )
+        return
+
+    if command == "/skip":
+        await state.update_data(photo_file_id=None)
+        await state.set_state(ClanForm.leader)
+        await message.answer(
+            "Юзернейм лидера клана.\n"
+            "По кнопке «Вступить в клан» откроется личный чат с ним.\n"
+            "Пример: @nickname\n\n"
+            "Отмена — /cancel"
+        )
+        return
+
+    await message.answer(
+        "Пришлите картинку, /skip или /cancel."
+    )
+
+
+@router.message(StateFilter(ClanForm.leader), F.text)
+async def clan_form_leader(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    username = normalize_leader_username(message.text or "")
+
+    if not username:
+        await message.answer(
+            "Нужен юзернейм Telegram, например @nickname. "
+            "По нему откроется личный чат. Числовой ID не подойдёт."
+        )
+        return
+
+    data = await state.get_data()
+    name = str(data.get("name") or "").strip()
+    description = str(data.get("description") or "").strip()
+
+    if not name or not description:
+        await state.clear()
+        await message.answer(
+            "Данные клана потерялись. Откройте добавление ещё раз."
+        )
+        return
+
+    try:
+        create_clan(
+            name,
+            description,
+            data.get("photo_file_id"),
+            username,
+        )
+    except Exception as error:
+        DB.rollback()
+        print(f"Клан не создан: {error}")
+        await message.answer(
+            "Не удалось сохранить клан. Попробуйте ещё раз.",
+            parse_mode=None,
+        )
+        return
+
+    await state.clear()
+    await message.answer(
+        "Клан добавлен. Он уже есть в кнопке «Кланы»."
+    )
+    rows = list_clans()
+    await message.answer(
+        clans_admin_text(rows),
+        reply_markup=clans_admin_keyboard(rows),
+    )
+
+
+@router.message(StateFilter(ClanForm.edit_name), F.text)
+async def clan_edit_name(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    text = one_line(message.text, 80)
+
+    if not text or text.startswith("/"):
+        await message.answer("Напишите название или /cancel.")
+        return
+
+    if len(text) > 64:
+        await message.answer("Название длиннее 64 символов. Сократите его.")
+        return
+
+    data = await state.get_data()
+    clan_id = int(data.get("clan_id") or 0)
+
+    if not get_clan(clan_id):
+        await state.clear()
+        await message.answer("Клан уже удалён.")
+        return
+
+    update_clan_fields(clan_id, name=text)
+    await finish_clan_edit(message, state, clan_id, "Название обновлено.")
+
+
+@router.message(StateFilter(ClanForm.edit_description), F.text)
+async def clan_edit_description(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    text = (message.text or "").strip()
+
+    if not text or text.startswith("/"):
+        await message.answer("Нужно описание текстом или /cancel.")
+        return
+
+    if len(text) > 3500:
+        await message.answer("Описание длиннее 3500 символов. Сократите его.")
+        return
+
+    data = await state.get_data()
+    clan_id = int(data.get("clan_id") or 0)
+
+    if not get_clan(clan_id):
+        await state.clear()
+        await message.answer("Клан уже удалён.")
+        return
+
+    update_clan_fields(clan_id, description=text)
+    await finish_clan_edit(message, state, clan_id, "Описание обновлено.")
+
+
+@router.message(StateFilter(ClanForm.edit_leader), F.text)
+async def clan_edit_leader(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    username = normalize_leader_username(message.text or "")
+
+    if not username:
+        await message.answer(
+            "Нужен юзернейм Telegram, например @nickname."
+        )
+        return
+
+    data = await state.get_data()
+    clan_id = int(data.get("clan_id") or 0)
+
+    if not get_clan(clan_id):
+        await state.clear()
+        await message.answer("Клан уже удалён.")
+        return
+
+    update_clan_fields(clan_id, leader_username=username)
+    await finish_clan_edit(message, state, clan_id, "Лидер обновлён.")
+
+
+@router.message(
+    StateFilter(
+        ClanForm.name,
+        ClanForm.description,
+        ClanForm.leader,
+        ClanForm.edit_name,
+        ClanForm.edit_description,
+        ClanForm.edit_leader,
+    )
+)
+async def clan_form_text_invalid(message: Message):
+    await message.answer(
+        "На этом шаге нужен текст. Отмена — /cancel."
+    )
+
+
+@router.message(
+    StateFilter(
+        ClanForm.photo,
+        ClanForm.edit_photo,
+    )
+)
+async def clan_form_photo_invalid(message: Message):
+    await message.answer(
+        "Пришлите картинку или нажмите /cancel."
+    )
+
+
+@router.callback_query(F.data.startswith("clan:open:"))
+async def clan_open(callback: CallbackQuery):
+    parts = (callback.data or "").split(":")
+
+    if len(parts) < 3 or not parts[2].isdigit():
+        await callback.answer("Клан не найден.", show_alert=True)
+        return
+
+    clan = get_clan(int(parts[2]))
+
+    if not clan:
+        await callback.answer(
+            "Этого клана уже нет.",
+            show_alert=True,
+        )
+        return
+
+    await callback.answer()
+
+    if callback.message:
+        await send_rich_card(
+            callback.message,
+            clan_public_text(clan),
+            clan["photo_file_id"],
+            clan_join_keyboard(clan),
+        )
+
+
+def _profile_snapshot(user_id: int) -> tuple[str | None, str | None]:
+    profile = get_profile(user_id)
+    nickname = None
+
+    if profile and str(profile["nickname"] or "").strip():
+        nickname = str(profile["nickname"]).strip()
+
+    username = stored_username(user_id) or None
+    return nickname, username
+
+
+def save_mutual_like(
+    low_id: int,
+    high_id: int,
+    low_created: str,
+    high_created: str,
+) -> None:
+    low_id = int(low_id)
+    high_id = int(high_id)
+
+    if low_id <= 0 or high_id <= 0 or low_id == high_id:
+        return
+
+    if low_id > high_id:
+        low_id, high_id = high_id, low_id
+        low_created, high_created = high_created, low_created
+
+    try:
+        low_at = parse_db_time(low_created)
+    except Exception:
+        low_at = datetime.now(timezone.utc).replace(microsecond=0)
+
+    try:
+        high_at = parse_db_time(high_created)
+    except Exception:
+        high_at = low_at
+
+    mutual_at = low_at if low_at >= high_at else high_at
+    low_nickname, low_username = _profile_snapshot(low_id)
+    high_nickname, high_username = _profile_snapshot(high_id)
+    DB.execute(
+        """
+        INSERT INTO mutual_likes (
+            user_low,
+            user_high,
+            low_liked_at,
+            high_liked_at,
+            mutual_at,
+            low_nickname,
+            high_nickname,
+            low_username,
+            high_username
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_low, user_high) DO NOTHING
+        """,
+        (
+            low_id,
+            high_id,
+            low_created,
+            high_created,
+            format_db_time(mutual_at),
+            low_nickname,
+            high_nickname,
+            low_username,
+            high_username,
+        ),
+    )
+    DB.commit()
+
+
+def remember_mutual_like(first_id: int, second_id: int) -> None:
+    if first_id <= 0 or second_id <= 0 or first_id == second_id:
+        return
+
+    low, high = (
+        (first_id, second_id)
+        if first_id < second_id
+        else (second_id, first_id)
+    )
+
+    try:
+        rows = DB.execute(
+            """
+            SELECT from_user, created
+            FROM swipes
+            WHERE action = 'like'
+              AND (
+                  (from_user = ? AND to_user = ?)
+                  OR
+                  (from_user = ? AND to_user = ?)
+              )
+            """,
+            (low, high, high, low),
+        ).fetchall()
+    except Exception as error:
+        print(f"Лог взаимного лайка {low}/{high}: {error}")
+        return
+
+    times = {
+        int(row["from_user"]): str(row["created"] or "")
+        for row in rows
+    }
+
+    if low not in times or high not in times:
+        return
+
+    try:
+        save_mutual_like(low, high, times[low], times[high])
+    except Exception as error:
+        DB.rollback()
+        print(f"Не записан взаимный лайк {low}/{high}: {error}")
+
+
+def backfill_mutual_likes() -> None:
+    try:
+        rows = DB.execute(
+            """
+            SELECT
+                a.from_user AS left_id,
+                a.to_user AS right_id,
+                a.created AS left_created,
+                b.created AS right_created
+            FROM swipes a
+            INNER JOIN swipes b
+                ON b.from_user = a.to_user
+               AND b.to_user = a.from_user
+               AND b.action = 'like'
+            WHERE a.action = 'like'
+              AND a.from_user < a.to_user
+            """
+        ).fetchall()
+    except Exception as error:
+        print(f"Старые взаимные лайки: {error}")
+        return
+
+    for row in rows:
+        try:
+            save_mutual_like(
+                int(row["left_id"]),
+                int(row["right_id"]),
+                str(row["left_created"] or ""),
+                str(row["right_created"] or ""),
+            )
+        except Exception as error:
+            DB.rollback()
+            print(f"Старый взаимный лайк: {error}")
+
+
+def _entry_from_log_row(row) -> dict:
+    raw = str(row["mutual_at"] or "")
+
+    try:
+        mutual_at = parse_db_time(raw)
+    except Exception:
+        mutual_at = datetime.now(timezone.utc).replace(microsecond=0)
+
+    return {
+        "left_id": int(row["user_low"]),
+        "right_id": int(row["user_high"]),
+        "left_created": str(row["low_liked_at"] or ""),
+        "right_created": str(row["high_liked_at"] or ""),
+        "mutual_at": mutual_at,
+        "left_nickname": str(row["low_nickname"] or ""),
+        "right_nickname": str(row["high_nickname"] or ""),
+        "left_username": str(row["low_username"] or ""),
+        "right_username": str(row["high_username"] or ""),
+    }
+
+
+def mutual_like_entries() -> list[dict]:
+    rows = DB.execute(
+        """
+        SELECT *
+        FROM mutual_likes
+        ORDER BY mutual_at DESC, user_low, user_high
+        """
+    ).fetchall()
+    return [_entry_from_log_row(row) for row in rows]
+
+
+def mutual_like_count() -> int:
+    try:
+        row = DB.execute(
+            "SELECT COUNT(*) AS count FROM mutual_likes"
+        ).fetchone()
+    except Exception as error:
+        print(f"Взаимные лайки: {error}")
+        return 0
+
+    return int(row["count"]) if row else 0
+
+
+def mutual_like_between(left_id: int, right_id: int):
+    if left_id > right_id:
+        left_id, right_id = right_id, left_id
+
+    try:
+        row = DB.execute(
+            """
+            SELECT *
+            FROM mutual_likes
+            WHERE user_low = ? AND user_high = ?
+            """,
+            (left_id, right_id),
+        ).fetchone()
+    except Exception as error:
+        print(f"Взаимный лайк {left_id}/{right_id}: {error}")
+        return None
+
+    if not row:
+        return None
+
+    return _entry_from_log_row(row)
+
+
+def match_short_name(
+    user_id: int,
+    nickname: str | None = None,
+    username: str | None = None,
+) -> str:
+    profile = get_profile(user_id)
+
+    if profile and str(profile["nickname"] or "").strip():
+        return one_line(profile["nickname"], 40)
+
+    if str(nickname or "").strip():
+        return one_line(nickname, 40)
+
+    live_username = stored_username(user_id) or str(username or "").strip()
+
+    if live_username:
+        return "@" + live_username
+
+    return str(user_id)
+
+
+def match_button_text(entry: dict) -> str:
+    when = entry["mutual_at"].astimezone(MSK).strftime("%d.%m.%Y, %H:%M")
+    left = match_short_name(
+        entry["left_id"],
+        entry.get("left_nickname"),
+        entry.get("left_username"),
+    )
+    right = match_short_name(
+        entry["right_id"],
+        entry.get("right_nickname"),
+        entry.get("right_username"),
+    )
+    prefix = f"{when} · "
+    joiner = " ↔ "
+    room = 64 - len(prefix) - len(joiner)
+
+    if room < 3:
+        return when[:64]
+
+    half = max(1, room // 2)
+
+    if len(left) > half:
+        left = left[: half - 1] + "…"
+
+    right_room = room - len(left)
+
+    if len(right) > right_room:
+        right = right[: max(1, right_room - 1)] + "…"
+
+    return f"{prefix}{left}{joiner}{right}"[:64]
+
+
+def match_person_html(
+    user_id: int,
+    nickname: str | None = None,
+    username: str | None = None,
+) -> str:
+    profile = get_profile(user_id)
+    shown_nickname = ""
+
+    if profile and str(profile["nickname"] or "").strip():
+        shown_nickname = str(profile["nickname"]).strip()
+    elif str(nickname or "").strip():
+        shown_nickname = str(nickname).strip()
+
+    shown_username = stored_username(user_id) or str(username or "").strip()
+    parts = []
+
+    if shown_nickname:
+        parts.append(html.escape(shown_nickname))
+
+    if shown_username:
+        parts.append("@" + html.escape(shown_username))
+
+    if not parts:
+        parts.append(f"id {user_id}")
+
+    parts.append(f"<code>{user_id}</code>")
+    return " · ".join(parts)
+
+
+def match_detail_text(entry: dict) -> str:
+    mutual = format_exact_msk(format_db_time(entry["mutual_at"]))
+    left_when = format_exact_msk(entry["left_created"])
+    right_when = format_exact_msk(entry["right_created"])
+    left_id = entry["left_id"]
+    right_id = entry["right_id"]
+    text = (
+        "<b>Взаимный лайк</b>\n"
+        f"Взаимно с: {html.escape(mutual)}\n\n"
+        f"{match_person_html(left_id, entry.get('left_nickname'), entry.get('left_username'))} лайкнул "
+        f"{match_person_html(right_id, entry.get('right_nickname'), entry.get('right_username'))}\n"
+        f"Когда: {html.escape(left_when)}\n\n"
+        f"{match_person_html(right_id, entry.get('right_nickname'), entry.get('right_username'))} лайкнул "
+        f"{match_person_html(left_id, entry.get('left_nickname'), entry.get('left_username'))}\n"
+        f"Когда: {html.escape(right_when)}"
+    )
+
+    if len(text) > 4000:
+        text = text[:3999] + "…"
+
+    return text
+
+
+def stats_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                text="❤️ Взаимные лайки",
+                callback_data="admin:matches:0",
+            )
+        ]
+    ]
+    rows.extend(list(admin_keyboard().inline_keyboard))
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def matches_keyboard(entries, page: int, has_next: bool) -> InlineKeyboardMarkup:
+    buttons = []
+
+    for entry in entries:
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text=match_button_text(entry),
+                    callback_data=(
+                        f"admin:match:{entry['left_id']}:{entry['right_id']}"
+                    ),
+                )
+            ]
+        )
+
+    navigation = []
+
+    if page > 0:
+        navigation.append(
+            InlineKeyboardButton(
+                text="⬅️",
+                callback_data=f"admin:matches:{page - 1}",
+            )
+        )
+
+    if has_next:
+        navigation.append(
+            InlineKeyboardButton(
+                text="➡️",
+                callback_data=f"admin:matches:{page + 1}",
+            )
+        )
+
+    if navigation:
+        buttons.append(navigation)
+
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text="⬅️ К статистике",
+                callback_data="admin:stats",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def handle_match_admin(
+    callback: CallbackQuery,
+    parts: list[str],
+    action: str,
+) -> None:
+    if action == "matches":
+        page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+        limit = 8
+
+        try:
+            entries = mutual_like_entries()
+        except Exception as error:
+            print(f"Лог взаимных лайков: {error}")
+            await callback.answer(
+                "Не удалось открыть лог.",
+                show_alert=True,
+            )
+            return
+
+        total = len(entries)
+        chunk = entries[page * limit: page * limit + limit + 1]
+        has_next = len(chunk) > limit
+        chunk = chunk[:limit]
+
+        if page > 0 and not chunk:
+            await callback.answer("Дальше записей нет.", show_alert=True)
+            return
+
+        await callback.answer()
+
+        if not callback.message:
+            return
+
+        if total == 0:
+            text = (
+                "<b>Взаимные лайки</b>\n\n"
+                "Пока взаимных лайков нет."
+            )
+        else:
+            text = (
+                f"<b>Взаимные лайки</b> — страница {page + 1}\n"
+                f"Всего: {total}\n\n"
+                "На кнопке — момент, когда лайк стал взаимным, "
+                "и кто с кем совпал."
+            )
+
+        await edit_or_send(
+            callback.message,
+            text,
+            matches_keyboard(chunk, page, has_next),
+        )
+        return
+
+    if action == "match":
+        if (
+            len(parts) < 4
+            or not parts[2].isdigit()
+            or not parts[3].isdigit()
+        ):
+            await callback.answer(
+                "Запись не найдена.",
+                show_alert=True,
+            )
+            return
+
+        entry = mutual_like_between(int(parts[2]), int(parts[3]))
+
+        if not entry:
+            await callback.answer(
+                "Этот взаимный лайк уже не найден.",
+                show_alert=True,
+            )
+            return
+
+        await callback.answer()
+
+        if callback.message:
+            await edit_or_send(
+                callback.message,
+                match_detail_text(entry),
+                InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(
+                                text="⬅️ К логу",
+                                callback_data="admin:matches:0",
+                            )
+                        ],
+                        [
+                            InlineKeyboardButton(
+                                text="К статистике",
+                                callback_data="admin:stats",
+                            )
+                        ],
+                    ]
+                ),
+            )
+
+        return
+
+    await callback.answer("Некорректный запрос.", show_alert=True)
+
+
+# ============================================================
 # АДМИНКА: ОСНОВНЫЕ CALLBACK
 # ============================================================
 
@@ -7753,8 +9362,38 @@ async def admin_callback(
         "task_send",
         "task_drop",
         "task_templates",
+        "clans",
+        "clan",
+        "clan_new",
+        "clan_pin",
+        "clan_del",
+        "clan_del_yes",
+        "clan_name",
+        "clan_desc",
+        "clan_photo",
+        "clan_leader",
+        "clan_templates",
+        "clan_unpin",
+        "matches",
+        "match",
     }:
-        await handle_task_admin(callback, state, bot, parts, action)
+        if action in {
+            "tasks",
+            "task",
+            "task_new",
+            "task_dur",
+            "task_send",
+            "task_drop",
+            "task_templates",
+        }:
+            await handle_task_admin(callback, state, bot, parts, action)
+            return
+
+        if action in {"matches", "match"}:
+            await handle_match_admin(callback, parts, action)
+            return
+
+        await handle_clan_admin(callback, state, parts, action)
         return
 
     if action == "menu":
@@ -8273,12 +9912,13 @@ async def admin_callback(
                 "📊 <b>Статистика</b>\n\n"
                 f"Всего анкет: {total}\n"
                 f"Активных анкет: {active}\n"
-                f"Открытых жалоб: {reports}\n\n"
+                f"Открытых жалоб: {reports}\n"
+                f"Взаимных лайков: {mutual_like_count()}\n\n"
                 f"Активных пользователей: {active_users}\n"
                 "действовали менее суток назад\n"
                 f"Неактивных пользователей: {inactive_users}\n"
                 "не взаимодействовали более суток",
-                reply_markup=admin_keyboard(),
+                reply_markup=stats_keyboard(),
             )
 
         return
@@ -9073,6 +10713,22 @@ async def admin_message_select(
             "{winner} — кликабельный победитель\n\n"
             "Не вставляйте эти имена вручную в другие шаблоны: "
             "они работают только в текстах задания."
+        )
+    elif key == "clans_intro":
+        hint += (
+            "\n\nЭто текст кнопки «Кланы», когда кланы уже добавлены. "
+            "Кнопки с названиями кланов бот ставит под сообщением сам."
+        )
+    elif key == "clans_empty":
+        hint += (
+            "\n\nЭто текст кнопки «Кланы», пока не добавлен ни один клан."
+        )
+    elif key == "clans_join":
+        hint += (
+            "\n\nЭто подпись кнопки под карточкой клана. "
+            "По ней открывается личный чат с лидером. "
+            "Картинка этого шаблона нигде не показывается. "
+            "На кнопке остаётся не больше 64 символов."
         )
 
     await callback.message.answer(hint)
@@ -10690,6 +12346,7 @@ async def main():
 
     init_database()
     print(f"База данных: {DB_FILE}", flush=True)
+    backfill_mutual_likes()
     sync_all_referral_premium()
 
     bot = Bot(
