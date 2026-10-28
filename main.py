@@ -260,6 +260,10 @@ class ButtonForm(StatesGroup):
     text = State()
 
 
+class ViewLimitForm(StatesGroup):
+    value = State()
+
+
 PROFILE_FIELDS = [
     "nickname",
     "gender",
@@ -654,6 +658,11 @@ def init_database() -> None:
             low_username TEXT,
             high_username TEXT,
             PRIMARY KEY (user_low, user_high)
+        );
+
+        CREATE TABLE IF NOT EXISTS bot_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
         );
         """
     )
@@ -2464,6 +2473,7 @@ ADMIN_STATE_PREFIXES = (
     "TaskForm:",
     "ClanForm:",
     "ButtonForm:",
+    "ViewLimitForm:",
 )
 
 
@@ -3037,6 +3047,16 @@ DEFAULT_MESSAGES = {
         "Цель: {goal}\n"
         "Нужно было пригласить: {invites}"
     ),
+    "match_alert": (
+        "🎉 Взаимный лайк!\n"
+        "Осторожно! Если вам предлагают купить аккаунт - отказывайтесь, "
+        "с огромной вероятностью вас хотят обмануть, сообщайте о таких "
+        "случаях со скриншотом доказательств во вкладке «Помощь»"
+    ),
+    "match_warning": (
+        "Осторожно! Если вам предлагают купить ваш аккаунт - "
+        "отказывайтесь, с огромной вероятностью вас хотят обмануть."
+    ),
     "clans_intro": (
         "Здесь ты можешь вступить в один из дружелюбных кланов "
         "на свой выбор из списка ниже!"
@@ -3044,6 +3064,29 @@ DEFAULT_MESSAGES = {
     "clans_empty": "Кланы скоро появятся",
     "clans_join": "Вступить в клан",
 }
+
+# Шаблоны, у которых фото не используется
+NO_PHOTO_KEYS = {"match_alert", "match_warning"}
+ALERT_MAX_UNITS = 200  # лимит Telegram на show_alert
+
+
+def _text_units(value: str) -> int:
+    return len(value.encode("utf-16-le")) // 2
+
+
+def match_alert_text() -> str:
+    text = (get_message_text("match_alert") or "").strip()
+
+    if not text:
+        text = DEFAULT_MESSAGES["match_alert"]
+
+    if _text_units(text) > ALERT_MAX_UNITS:
+        while _text_units(text) > ALERT_MAX_UNITS - 1:
+            text = text[:-1]
+
+        text = text.rstrip() + "…"
+
+    return text
 
 
 def get_message_row(key: str):
@@ -3763,6 +3806,12 @@ def admin_keyboard() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
+                    text=f"👁 Лимит анкет в день: {get_view_limit()}",
+                    callback_data="admin:view_limit",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
                     text="🎯 Задания",
                     callback_data="admin:tasks",
                 ),
@@ -4452,6 +4501,8 @@ def admin_messages_keyboard() -> InlineKeyboardMarkup:
         "premium": "Premium за приглашения",
         "tiktok": "Заработай на тик-токах",
         "reengage": "Авторассылка неактивным",
+        "match_alert": "Взаимный лайк: всплывающее окно",
+        "match_warning": "Взаимный лайк: предупреждение",
     }
 
     buttons = [
@@ -6233,14 +6284,53 @@ async def profile_photo_invalid(message: Message):
 # ПОИСК
 # ============================================================
 
-VIEW_DAILY_LIMIT = 25
-VIEW_LIMIT_TEXT = (
-    "Вы превысили суточный лимит просмотра анкет 25/25. "
-    "Чтобы увеличить лимит нужен Premium, его можно получить бесплатно "
-    "за приглашение людей в бота. Также в Premium открываются функции "
-    "\"Поиск по полу\" и \"Поднятие анкеты в топ\". "
-    "Получить премиум - /prem"
-)
+VIEW_DAILY_LIMIT_DEFAULT = 25
+VIEW_LIMIT_MIN = 1
+VIEW_LIMIT_MAX = 10000
+
+
+def get_view_limit() -> int:
+    try:
+        row = DB.execute(
+            "SELECT value FROM bot_settings WHERE key = 'view_daily_limit'"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return VIEW_DAILY_LIMIT_DEFAULT
+
+    if row and str(row["value"]).isdigit():
+        value = int(row["value"])
+
+        if VIEW_LIMIT_MIN <= value <= VIEW_LIMIT_MAX:
+            return value
+
+    return VIEW_DAILY_LIMIT_DEFAULT
+
+
+def set_view_limit(value: int) -> None:
+    try:
+        DB.execute(
+            """
+            INSERT INTO bot_settings (key, value)
+            VALUES ('view_daily_limit', ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (str(int(value)),),
+        )
+        DB.commit()
+    except Exception:
+        DB.rollback()
+        raise
+
+
+def view_limit_text() -> str:
+    limit = get_view_limit()
+    return (
+        f"Вы превысили суточный лимит просмотра анкет {limit}/{limit}. "
+        "Чтобы увеличить лимит нужен Premium, его можно получить бесплатно "
+        "за приглашение людей в бота. Также в Premium открываются функции "
+        "\"Поиск по полу\" и \"Поднятие анкеты в топ\". "
+        "Получить премиум - /prem"
+    )
 
 
 def msk_day() -> str:
@@ -6296,7 +6386,7 @@ def consume_profile_view(user_id: int, target_id: int) -> None:
 
 async def answer_view_limit(message: Message, user_id: int) -> None:
     await message.answer(
-        VIEW_LIMIT_TEXT,
+        view_limit_text(),
         reply_markup=keyboard_for(user_id),
     )
 
@@ -6381,7 +6471,7 @@ async def search_next(
     target_id = int(profile["user_id"])
 
     if not has_premium(user_id) and not profile_seen_today(user_id, target_id):
-        if views_used_today(user_id) >= VIEW_DAILY_LIMIT:
+        if views_used_today(user_id) >= get_view_limit():
             await answer_view_limit(message, user_id)
             return
 
@@ -6518,6 +6608,12 @@ async def notify_match(
     if not first or not second:
         return
 
+    match_prefix = "🎉 У вас взаимный лайк!"
+    match_warning = get_message_text("match_warning").strip()
+
+    if match_warning:
+        match_prefix += "\n\n" + match_warning
+
     for user_id, other, other_id in (
         (first_id, second, second_id),
         (second_id, first, first_id),
@@ -6539,7 +6635,7 @@ async def notify_match(
                 user_id,
                 other,
                 reply_markup=keyboard,
-                prefix="🎉 У вас взаимный лайк!",
+                prefix=match_prefix,
                 force_photo=True,
             )
         except Exception as error:
@@ -6628,7 +6724,7 @@ async def process_likeback(
         if mutual:
             remember_mutual_like(user_id, liker_id)
             await callback.answer(
-                "🎉 Взаимный лайк!",
+                match_alert_text(),
                 show_alert=True,
             )
             await notify_match(bot, user_id, liker_id)
@@ -6754,7 +6850,7 @@ async def process_swipe(
         if mutual:
             remember_mutual_like(user_id, target_id)
             await callback.answer(
-                "🎉 Взаимный лайк!",
+                match_alert_text(),
                 show_alert=True,
             )
             await notify_match(
@@ -10920,6 +11016,24 @@ async def admin_callback(
 
         return
 
+    if action == "view_limit":
+        await state.clear()
+        await state.set_state(ViewLimitForm.value)
+        await callback.answer()
+
+        if callback.message:
+            await callback.message.answer(
+                "<b>Лимит анкет в день (без Premium)</b>\n\n"
+                f"Сейчас: <b>{get_view_limit()}</b>\n\n"
+                f"Пришлите новое число от {VIEW_LIMIT_MIN} "
+                f"до {VIEW_LIMIT_MAX}.\n"
+                "Значение применяется сразу, счётчики за сегодня "
+                "не сбрасываются.\n\n"
+                "Отмена — /cancel"
+            )
+
+        return
+
     if action == "messages":
         await callback.answer()
 
@@ -11011,6 +11125,48 @@ async def admin_premium_query(
         "Нашлось несколько человек. Выберите:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
+
+
+@router.message(StateFilter(ViewLimitForm.value), F.text)
+async def admin_view_limit_value(
+    message: Message,
+    state: FSMContext,
+):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+
+    text = (message.text or "").strip()
+
+    if not text.isdigit() or not (
+        VIEW_LIMIT_MIN <= int(text) <= VIEW_LIMIT_MAX
+    ):
+        await message.answer(
+            f"Нужно целое число от {VIEW_LIMIT_MIN} до {VIEW_LIMIT_MAX}.\n"
+            "Отмена — /cancel."
+        )
+        return
+
+    try:
+        set_view_limit(int(text))
+    except Exception as error:
+        print(f"Лимит просмотров: {error}")
+        await message.answer(
+            "Не удалось сохранить лимит. Попробуйте ещё раз.",
+            parse_mode=None,
+        )
+        return
+
+    await state.clear()
+    await message.answer(
+        f"✅ Лимит анкет в день без Premium: <b>{int(text)}</b>",
+        reply_markup=admin_keyboard(),
+    )
+
+
+@router.message(StateFilter(ViewLimitForm.value))
+async def admin_view_limit_invalid(message: Message):
+    await message.answer("Пришлите число или нажмите /cancel.")
 
 
 @router.message(
@@ -11183,6 +11339,21 @@ async def admin_message_select(
             "Не вставляйте эти имена вручную в другие шаблоны: "
             "они работают только в текстах задания."
         )
+    elif key == "match_alert":
+        hint += (
+            "\n\nЭто весь текст всплывающего окна при взаимном лайке, "
+            "вместе с «🎉 Взаимный лайк!». Telegram пропускает не больше "
+            "200 символов. Фото здесь не используется, достаточно "
+            "прислать текст."
+        )
+    elif key == "match_warning":
+        hint += (
+            "\n\nЭтот текст добавляется под «🎉 У вас взаимный лайк!» "
+            "в сообщении с анкетой. Заголовок бот ставит сам. "
+            "Фото здесь не используется. Если анкета с фото получится "
+            "длиннее 1024 символов, Telegram покажет фото и текст "
+            "двумя сообщениями."
+        )
     elif key == "clans_intro":
         hint += (
             "\n\nЭто текст кнопки «Кланы», когда кланы уже добавлены. "
@@ -11222,6 +11393,32 @@ async def admin_message_text(
         await message.answer(
             "Отправьте текст шаблона обычным сообщением.\n"
             "Отмена — /cancel."
+        )
+        return
+
+    guard_data = await state.get_data()
+    guard_key = guard_data.get("message_key")
+
+    if guard_key in NO_PHOTO_KEYS:
+        if guard_key == "match_alert" and (
+            _text_units(text) > ALERT_MAX_UNITS
+        ):
+            await message.answer(
+                "Слишком длинно для всплывающего окна: Telegram "
+                f"разрешает до {ALERT_MAX_UNITS} символов, "
+                f"у вас {_text_units(text)}. Сократите текст.",
+                parse_mode=None,
+            )
+            return
+
+        await finish_template_save(
+            message,
+            state,
+            guard_key,
+            text,
+            None,
+            "✅ Шаблон сохранён. Так он выглядит (в окне или "
+            "сообщении текст будет тот же):",
         )
         return
 
@@ -11271,6 +11468,13 @@ async def admin_message_photo(
         return
 
     data = await state.get_data()
+
+    if data.get("message_key") in NO_PHOTO_KEYS:
+        await message.answer(
+            "Для этого шаблона фото не используется. Отправьте текст."
+        )
+        return
+
     text = await template_text_for_media(message, state)
 
     if not text:
