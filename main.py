@@ -2,8 +2,8 @@
 # Запуск: BOT_TOKEN=123:abc ADMIN_IDS=111,222 SUPERADMIN_IDS=111 python pubg_bot.py
 # Если SUPERADMIN_IDS не задан, супер-админами считаются ADMIN_IDS.
 # Снятие админа из ADMIN_IDS делается в панели супер-админа и хранится в базе.
-# Цензура 18+ на фото анкеты работает через nudenet. Без этой библиотеки бот
-# запустится, но проверку изображений выполнить не сможет.
+# Цензура 18+ на фото и на превью видео работает через nudenet.
+# Без этой библиотеки бот запустится, но проверку изображений выполнить не сможет.
 
 import asyncio
 import html
@@ -32,8 +32,10 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     KeyboardButton,
     Message,
+    MessageEntity,
     ReplyKeyboardMarkup,
     TelegramObject,
+    User,
 )
 
 
@@ -124,6 +126,7 @@ router = Router()
 
 COLLECTION_MAX = 100
 BLACK_SQUARE_PHOTO = "black_square"
+VIDEO_MEDIA_PREFIX = "video:"
 _BLACK_SQUARE_PNG: bytes | None = None
 
 
@@ -238,6 +241,10 @@ class ProblemForm(StatesGroup):
     description = State()
 
 
+class ReportForm(StatesGroup):
+    reason = State()
+
+
 class TaskForm(StatesGroup):
     prize = State()
     goal = State()
@@ -331,7 +338,7 @@ FIELD_NAMES = {
     "schedule": "Время игры",
     "language": "Язык общения",
     "bio": "О себе",
-    "photo_file_id": "Фото",
+    "photo_file_id": "Фото / видео",
 }
 
 
@@ -479,7 +486,8 @@ def init_database() -> None:
             reporter INTEGER NOT NULL,
             reported INTEGER NOT NULL,
             created TEXT NOT NULL,
-            resolved INTEGER NOT NULL DEFAULT 0
+            resolved INTEGER NOT NULL DEFAULT 0,
+            reason TEXT
         );
 
         CREATE TABLE IF NOT EXISTS blocks (
@@ -750,6 +758,18 @@ def init_database() -> None:
             "ALTER TABLE menu_buttons ADD COLUMN previous TEXT"
         )
 
+    report_columns = {
+        row["name"]
+        for row in DB.execute(
+            "PRAGMA table_info(reports)"
+        ).fetchall()
+    }
+
+    if report_columns and "reason" not in report_columns:
+        DB.execute(
+            "ALTER TABLE reports ADD COLUMN reason TEXT"
+        )
+
     DB.commit()
 
 
@@ -854,6 +874,24 @@ def stored_username(user_id: int) -> str:
         return ""
 
     return str(row["username"] or "").strip()
+
+
+def stored_first_name(user_id: int) -> str:
+    row = get_user_row(user_id)
+
+    if not row:
+        return ""
+
+    return str(row["first_name"] or "").strip()
+
+
+def telegram_username(user_id: int) -> str | None:
+    username = stored_username(user_id)
+
+    if re.fullmatch(r"[A-Za-z0-9_]{5,32}", username):
+        return username
+
+    return None
 
 
 def grant_admin(user_id: int, appointed_by: int) -> None:
@@ -2747,8 +2785,8 @@ def nsfw_reject_text(
     permanent: bool,
 ) -> str:
     lines = [
-        "Фото не принято: на изображении есть контент 18+.",
-        "Такое фото нельзя ставить в анкету.",
+        "Медиа не принято: на изображении есть контент 18+.",
+        "Такое фото или видео нельзя ставить в анкету.",
     ]
 
     if permanent:
@@ -2793,7 +2831,7 @@ async def reject_nsfw_photo(message: Message) -> None:
         DB.rollback()
         print(f"Не записана блокировка 18+: {error}")
         await message.answer(
-            "Фото не принято: на изображении есть контент 18+.",
+            "Медиа не принято: на изображении есть контент 18+.",
             parse_mode=None,
         )
         return
@@ -2838,6 +2876,46 @@ async def accept_profile_photo(
     data = await state.get_data()
     values = data.get("values", {})
     values["photo_file_id"] = file_id
+    await state.update_data(values=values)
+    await next_field(message, state, "photo_file_id")
+
+
+async def accept_profile_video(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    file_id: str,
+    thumb_file_id: str | None,
+) -> None:
+    try:
+        await message.bot.send_chat_action(message.chat.id, "upload_video")
+    except Exception:
+        pass
+
+    if thumb_file_id:
+        try:
+            nsfw = await telegram_file_is_nsfw(bot, thumb_file_id)
+        except Exception as error:
+            print(f"Проверка видео 18+ не выполнена: {error}")
+            await message.answer(
+                "Не удалось проверить видео. "
+                "Отправьте другое видео или фото."
+            )
+            return
+
+        if nsfw:
+            await reject_nsfw_photo(message)
+            return
+    else:
+        print(
+            f"Видео {message.from_user.id} без превью, "
+            "проверка 18+ пропущена",
+            flush=True,
+        )
+
+    data = await state.get_data()
+    values = data.get("values", {})
+    values["photo_file_id"] = VIDEO_MEDIA_PREFIX + file_id
     await state.update_data(values=values)
     await next_field(message, state, "photo_file_id")
 
@@ -3063,10 +3141,16 @@ DEFAULT_MESSAGES = {
     ),
     "clans_empty": "Кланы скоро появятся",
     "clans_join": "Вступить в клан",
+    "match_no_username": (
+        "У этого человека нет @username, "
+        "обычная ссылка на Telegram его не откроет.\n"
+        "Нажмите на имя — откроется профиль: {name}\n"
+        "Telegram ID: {id}"
+    ),
 }
 
 # Шаблоны, у которых фото не используется
-NO_PHOTO_KEYS = {"match_alert", "match_warning"}
+NO_PHOTO_KEYS = {"match_alert", "match_warning", "match_no_username"}
 ALERT_MAX_UNITS = 200  # лимит Telegram на show_alert
 
 
@@ -3636,7 +3720,10 @@ class MenuButton(Filter):
     ) -> bool:
         current = await state.get_state()
 
-        if current and str(current).startswith("ButtonForm:"):
+        if current and str(current).startswith((
+            "ButtonForm:",
+            "ReportForm:",
+        )):
             return False
 
         return menu_button_key(message.text or "") == self.key
@@ -4192,6 +4279,7 @@ def options_keyboard(
 
 def photo_keyboard(
     has_photo: bool,
+    is_video: bool = False,
 ) -> InlineKeyboardMarkup:
     buttons = []
 
@@ -4199,8 +4287,12 @@ def photo_keyboard(
         buttons.append(
             [
                 InlineKeyboardButton(
-                    text="✅ Оставить прежнее фото",
-callback_data="form_keep:photo_file_id",
+                    text=(
+                        "✅ Оставить прежнее видео"
+                        if is_video
+                        else "✅ Оставить прежнее фото"
+                    ),
+                    callback_data="form_keep:photo_file_id",
                 )
             ]
         )
@@ -4208,7 +4300,7 @@ callback_data="form_keep:photo_file_id",
     buttons.append(
         [
             InlineKeyboardButton(
-                text="🖼 Загрузить новое фото",
+                text="🎬 Загрузить фото или видео",
                 callback_data="form_custom:photo_file_id",
             )
         ]
@@ -4217,7 +4309,7 @@ callback_data="form_keep:photo_file_id",
     buttons.append(
         [
             InlineKeyboardButton(
-                text="⏭️ Пропустить фото",
+                text="⏭️ Пропустить",
                 callback_data="form_skip_photo",
             )
         ]
@@ -4503,6 +4595,7 @@ def admin_messages_keyboard() -> InlineKeyboardMarkup:
         "reengage": "Авторассылка неактивным",
         "match_alert": "Взаимный лайк: всплывающее окно",
         "match_warning": "Взаимный лайк: предупреждение",
+        "match_no_username": "Нет @username: открыть профиль",
     }
 
     buttons = [
@@ -4578,6 +4671,10 @@ def has_mutual_like(first_id: int, second_id: int) -> bool:
     return first_id in sides and second_id in sides
 
 
+def esc(value) -> str:
+    return html.escape(str(value if value is not None else ""))
+
+
 def profile_text(
     profile,
     reveal_contacts: bool = True,
@@ -4601,44 +4698,287 @@ def profile_text(
         bio = ""
 
     if reveal_contacts:
-        pubg_id_text = f"<code>{profile['pubg_id']}</code>"
+        pubg_id_text = f"<code>{esc(profile['pubg_id'])}</code>"
         note = ""
     else:
         pubg_id_text = "скрыто"
         if contact_note is None:
             note = f"\n\n{CONTACT_LOCKED_NOTE}"
         elif contact_note:
-            note = f"\n\n{contact_note}"
+            note = f"\n\n{esc(contact_note)}"
         else:
             note = ""
 
     limit = 4000 - len(note)
     text = (
-        f"🎮 <b>{profile['nickname']}</b>\n\n"
-        f"🚻 Пол: {gender}\n"
-        f"🎂 Возраст: {age}\n"
+        f"🎮 <b>{esc(profile['nickname'])}</b>\n\n"
+        f"🚻 Пол: {esc(gender)}\n"
+        f"🎂 Возраст: {esc(age)}\n"
         f"🆔 PUBG ID: {pubg_id_text}\n"
-        f"🌍 Сервер: {profile['server']}\n"
-        f"🎯 Режим: {profile['mode']}\n"
-        f"🏆 Ранг: {profile['rank']}\n"
-        f"📦 Уровень коллекции: {collection_text}\n"
-        f"🎙 Микрофон: {profile['voice']}\n"
-        f"🕒 Время игры: {profile['schedule']}\n"
-        f"💬 Язык: {profile['language']}"
+        f"🌍 Сервер: {esc(profile['server'])}\n"
+        f"🎯 Режим: {esc(profile['mode'])}\n"
+        f"🏆 Ранг: {esc(profile['rank'])}\n"
+        f"📦 Уровень коллекции: {esc(collection_text)}\n"
+        f"🎙 Микрофон: {esc(profile['voice'])}\n"
+        f"🕒 Время игры: {esc(profile['schedule'])}\n"
+        f"💬 Язык: {esc(profile['language'])}"
     )
 
     if bio:
-        suffix = f"\n\n📝 {bio}"
+        escaped_bio = esc(bio)
+        suffix = f"\n\n📝 {escaped_bio}"
 
         if len(text) + len(suffix) <= limit:
             text += suffix
         else:
             room = max(0, limit - len(text) - 2)
+            cut = bio
 
-            if room:
-                text += f"\n\n📝 {bio[:room]}"
+            while cut and len(f"\n\n📝 {esc(cut)}") > room:
+                cut = cut[:-1]
+
+            if cut:
+                text += f"\n\n📝 {esc(cut)}"
 
     return text + note
+
+
+def resolve_profile_media(
+    photo_id: str | None,
+    force_photo: bool = False,
+):
+    raw = (photo_id or "").strip()
+
+    if force_photo and not raw:
+        raw = BLACK_SQUARE_PHOTO
+
+    if not raw:
+        return None
+
+    if raw.startswith(VIDEO_MEDIA_PREFIX):
+        file_id = raw[len(VIDEO_MEDIA_PREFIX):].strip()
+
+        if not file_id:
+            return None
+
+        return "video", file_id
+
+    source = profile_photo_source(raw)
+
+    if source is None:
+        return None
+
+    return "photo", source
+
+
+def _markup_is_rejected(error: Exception) -> bool:
+    text = str(error).casefold()
+    return (
+        "button_url_invalid" in text
+        or "button_user_privacy_restricted" in text
+        or "wrong http url" in text
+        or "unsupported url" in text
+    )
+
+
+async def send_media_card(
+    message: Message | None,
+    *,
+    bot: Bot | None = None,
+    chat_id: int | None = None,
+    media_raw: str | None,
+    text: str,
+    reply_markup=None,
+    force_photo: bool = False,
+) -> None:
+    """
+    Сначала пытается отправить медиа с подписью и кнопками.
+    Если Telegram отклоняет сообщение (битая ссылка кнопки, HTML),
+    текст уходит отдельно и раньше «голой» картинки.
+    """
+    media = resolve_profile_media(
+        media_raw,
+        force_photo=force_photo,
+    )
+    body = text or ""
+
+    async def emit(method: str, source, caption, markup, parse_mode) -> None:
+        kwargs = {}
+
+        if caption:
+            kwargs["caption"] = caption
+            kwargs["parse_mode"] = parse_mode
+
+        if markup is not None:
+            kwargs["reply_markup"] = markup
+
+        if message is not None:
+            if method == "photo":
+                await message.answer_photo(photo=source, **kwargs)
+            elif method == "video":
+                await message.answer_video(video=source, **kwargs)
+            elif method == "animation":
+                await message.answer_animation(animation=source, **kwargs)
+            elif method == "document":
+                await message.answer_document(document=source, **kwargs)
+            else:
+                await message.answer(str(source), **kwargs)
+            return
+
+        if method == "photo":
+            await bot.send_photo(chat_id, photo=source, **kwargs)
+        elif method == "video":
+            await bot.send_video(chat_id, video=source, **kwargs)
+        elif method == "animation":
+            await bot.send_animation(chat_id, animation=source, **kwargs)
+        elif method == "document":
+            await bot.send_document(chat_id, document=source, **kwargs)
+        else:
+            await bot.send_message(chat_id, str(source), **kwargs)
+
+    async def emit_text(value: str, markup, parse_mode) -> None:
+        if not value:
+            return
+
+        kwargs = {"parse_mode": parse_mode}
+
+        if markup is not None:
+            kwargs["reply_markup"] = markup
+
+        if message is not None:
+            await message.answer(value, **kwargs)
+            return
+
+        await bot.send_message(chat_id, value, **kwargs)
+
+    async def emit_media(kind: str, source, caption, markup, parse_mode) -> None:
+        if kind != "video":
+            await emit("photo", source, caption, markup, parse_mode)
+            return
+
+        try:
+            await emit("video", source, caption, markup, parse_mode)
+        except Exception as video_error:
+            try:
+                await emit("animation", source, caption, markup, parse_mode)
+            except Exception:
+                try:
+                    await emit("document", source, caption, markup, parse_mode)
+                except Exception:
+                    raise video_error
+
+    if media and body and len(body) <= 1024:
+        kind, source = media
+        sent = False
+
+        for parse_mode in (ParseMode.HTML, None):
+            try:
+                await emit_media(
+                    kind,
+                    source,
+                    body,
+                    reply_markup,
+                    parse_mode,
+                )
+                sent = True
+                break
+            except Exception as error:
+                print(f"Анкета с медиа и подписью: {error}")
+
+                if reply_markup is None or not (
+                    _markup_is_rejected(error) or parse_mode is None
+                ):
+                    continue
+
+                try:
+                    await emit_media(kind, source, body, None, parse_mode)
+                    sent = True
+
+                    for button_mode in (ParseMode.HTML, None):
+                        try:
+                            await emit_text(
+                                "Кнопки к анкете:",
+                                reply_markup,
+                                button_mode,
+                            )
+                            break
+                        except Exception as button_error:
+                            print(f"Кнопки анкеты: {button_error}")
+
+                    break
+                except Exception as plain_error:
+                    print(f"Анкета с медиа без кнопок: {plain_error}")
+
+        if sent:
+            return
+
+    if len(body) > 4096:
+        body = body[:4095] + "…"
+
+    text_sent = False
+    last_error = None
+
+    for parse_mode in (ParseMode.HTML, None):
+        try:
+            await emit_text(body, reply_markup, parse_mode)
+            text_sent = True
+            break
+        except Exception as error:
+            last_error = error
+            print(f"Текст анкеты: {error}")
+
+            if reply_markup is None:
+                continue
+
+            try:
+                await emit_text(body, None, parse_mode)
+                text_sent = True
+
+                try:
+                    await emit_text(
+                        "Кнопки к анкете:",
+                        reply_markup,
+                        parse_mode,
+                    )
+                except Exception as button_error:
+                    print(f"Кнопки анкеты: {button_error}")
+
+                break
+            except Exception as plain_error:
+                last_error = plain_error
+                print(f"Текст анкеты без кнопок: {plain_error}")
+
+    if body and not text_sent:
+        raise last_error or RuntimeError("Не удалось отправить анкету")
+
+    if not media:
+        return
+
+    kind, source = media
+
+    try:
+        await emit_media(kind, source, None, None, None)
+        return
+    except Exception as error:
+        print(f"Медиа анкеты без подписи: {error}")
+
+    if force_photo:
+        try:
+            await emit(
+                "photo",
+                profile_photo_source(BLACK_SQUARE_PHOTO),
+                None,
+                None,
+                None,
+            )
+            return
+        except Exception as fallback_error:
+            print(f"Чёрный квадрат: {fallback_error}")
+
+    try:
+        await emit_text("⚠️ Медиа анкеты недоступно.", None, None)
+    except Exception as error:
+        print(f"Предупреждение о медиа: {error}")
 
 
 async def send_profile(
@@ -4646,40 +4986,18 @@ async def send_profile(
     profile,
     reply_markup=None,
     reveal_contacts: bool = True,
+    contact_note: str | None = None,
 ) -> None:
-    text = profile_text(profile, reveal_contacts=reveal_contacts)
-    photo = profile_photo_source(profile["photo_file_id"])
-
-    if photo and len(text) <= 1024:
-        try:
-            await message.answer_photo(
-                photo=photo,
-                caption=text,
-                reply_markup=reply_markup,
-            )
-            return
-        except Exception as error:
-            print(
-                f"Не удалось отправить фото анкеты "
-                f"{profile['user_id']}: {error}"
-            )
-
-    if photo:
-        try:
-            await message.answer_photo(
-                photo=profile_photo_source(profile["photo_file_id"])
-            )
-        except Exception as error:
-            print(
-                f"Фото анкеты {profile['user_id']} "
-                f"недоступно: {error}"
-            )
-            text += "\n\n⚠️ Фото анкеты недоступно."
-
-    await answer_text(
+    text = profile_text(
+        profile,
+        reveal_contacts=reveal_contacts,
+        contact_note=contact_note,
+    )
+    await send_media_card(
         message,
-        text,
-        reply_markup,
+        media_raw=profile["photo_file_id"],
+        text=text,
+        reply_markup=reply_markup,
     )
 
 
@@ -4694,75 +5012,14 @@ async def deliver_profile(
 ) -> None:
     body = profile_text(profile, reveal_contacts=reveal_contacts)
     text = f"{prefix}\n\n{body}" if prefix else body
-    photo_id = (profile["photo_file_id"] or "").strip()
-
-    if force_photo and not photo_id:
-        photo_id = BLACK_SQUARE_PHOTO
-
-    photo = profile_photo_source(photo_id)
-
-    if photo and len(text) <= 1024:
-        try:
-            await bot.send_photo(
-                chat_id,
-                photo=photo,
-                caption=text,
-                reply_markup=reply_markup,
-            )
-            return
-        except Exception as error:
-            print(
-                f"Не удалось отправить фото анкеты "
-                f"{profile['user_id']} в {chat_id}: {error}"
-            )
-
-            if force_photo and photo_id != BLACK_SQUARE_PHOTO:
-                try:
-                    await bot.send_photo(
-                        chat_id,
-                        photo=profile_photo_source(BLACK_SQUARE_PHOTO),
-                        caption=text,
-                        reply_markup=reply_markup,
-                    )
-                    return
-                except Exception as fallback_error:
-                    print(
-                        f"Чёрный квадрат для {chat_id}: {fallback_error}"
-                    )
-
-    if photo:
-        try:
-            await bot.send_photo(
-                chat_id,
-                photo=profile_photo_source(photo_id),
-            )
-        except Exception as error:
-            print(
-                f"Фото анкеты {profile['user_id']} "
-                f"недоступно для {chat_id}: {error}"
-            )
-
-            if force_photo and photo_id != BLACK_SQUARE_PHOTO:
-                try:
-                    await bot.send_photo(
-                        chat_id,
-                        photo=profile_photo_source(BLACK_SQUARE_PHOTO),
-                    )
-                except Exception as fallback_error:
-                    print(
-                        f"Чёрный квадрат для {chat_id}: {fallback_error}"
-                    )
-                    text += "\n\n⚠️ Фото анкеты недоступно."
-            else:
-                text += "\n\n⚠️ Фото анкеты недоступно."
-
-    if len(text) > 4096:
-        text = text[:4095] + "…"
-
-    await bot.send_message(
-        chat_id,
-        text,
+    await send_media_card(
+        None,
+        bot=bot,
+        chat_id=chat_id,
+        media_raw=profile["photo_file_id"],
+        text=text,
         reply_markup=reply_markup,
+        force_photo=force_photo,
     )
 
 
@@ -4806,8 +5063,8 @@ def form_prompt(
 
     if field_name == "photo_file_id":
         return (
-            "Отправьте фото профиля или выберите действие "
-            "с помощью кнопок ниже."
+            "Отправьте фото или видео профиля "
+            "или выберите действие кнопками ниже."
         )
 
     if field_name == "pubg_id":
@@ -4910,7 +5167,8 @@ async def ask_field(
         await message.answer(
             form_prompt(field_name, old_value),
             reply_markup=photo_keyboard(
-                bool(old_value)
+                bool(old_value),
+                str(old_value or "").startswith(VIDEO_MEDIA_PREFIX),
             ),
         )
         return
@@ -5014,8 +5272,9 @@ async def next_field(
     values = data.get("values", {})
 
     current_index = PROFILE_FIELDS.index(current_field)
+    partial = data.get("partial_edit")
 
-    if current_index == len(PROFILE_FIELDS) - 1:
+    if partial or current_index == len(PROFILE_FIELDS) - 1:
         target_user_id = int(data["target_user_id"])
 
         try:
@@ -5026,7 +5285,7 @@ async def next_field(
             await state.clear()
             await message.answer(
                 f"Не удалось сохранить анкету:\n{error}",
-                reply_markup=keyboard_for(message.chat.id),
+                reply_markup=keyboard_for(target_user_id),
             )
             return
 
@@ -5038,12 +5297,30 @@ async def next_field(
                 f"<code>{target_user_id}</code> сохранена.",
                 reply_markup=admin_keyboard(),
             )
+            return
+
+        if partial == "bio":
+            await message.answer(
+                "Описание обновлено.",
+                reply_markup=keyboard_for(target_user_id),
+            )
+        elif partial == "photo_file_id":
+            await message.answer(
+                "Фото или видео профиля обновлено.",
+                reply_markup=keyboard_for(target_user_id),
+            )
         else:
             await send_template(
                 message,
                 "profile_saved",
-                keyboard_for(message.chat.id),
+                keyboard_for(target_user_id),
             )
+            return
+
+        saved = get_profile(target_user_id)
+
+        if saved:
+            await send_profile(message, saved)
 
         return
 
@@ -5513,7 +5790,115 @@ async def menu_edit_profile(
     message: Message,
     state: FSMContext,
 ):
-    await start_profile_form(message, state)
+    if not get_profile(message.from_user.id):
+        await start_profile_form(message, state)
+        return
+
+    await state.clear()
+    await message.answer(
+        "Что изменить в анкете?",
+        reply_markup=edit_profile_keyboard(),
+    )
+
+
+def edit_profile_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Редактировать всю анкету",
+                    callback_data="edit:all",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Редактировать фото/видео профиля",
+                    callback_data="edit:media",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Редактировать описание",
+                    callback_data="edit:bio",
+                )
+            ],
+        ]
+    )
+
+
+async def start_scoped_profile_edit(
+    message: Message,
+    state: FSMContext,
+    user_id: int,
+    partial: str,
+) -> None:
+    old = get_profile(user_id)
+
+    if not old:
+        await start_profile_form(
+            message,
+            state,
+            target_user_id=user_id,
+        )
+        return
+
+    values = {}
+
+    for field in PROFILE_FIELDS:
+        if old[field] is not None:
+            values[field] = old[field]
+
+    await state.clear()
+    await state.update_data(
+        admin_form=False,
+        target_user_id=user_id,
+        values=values,
+        partial_edit=partial,
+    )
+    await state.set_state(PROFILE_STATES[partial])
+    await ask_field(message, partial, values)
+
+
+@router.callback_query(F.data.startswith("edit:"))
+async def edit_profile_choice(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
+    choice = (callback.data or "").split(":", 1)[1]
+    mapping = {
+        "all": None,
+        "media": "photo_file_id",
+        "bio": "bio",
+    }
+
+    if choice not in mapping:
+        await callback.answer(
+            "Неизвестное действие.",
+            show_alert=True,
+        )
+        return
+
+    if not callback.message:
+        await callback.answer()
+        return
+
+    await callback.answer()
+    partial = mapping[choice]
+
+    if partial is None:
+        await start_profile_form(
+            callback.message,
+            state,
+            target_user_id=callback.from_user.id,
+        )
+        return
+
+    await start_scoped_profile_edit(
+        callback.message,
+        state,
+        callback.from_user.id,
+        partial,
+    )
 
 
 @router.message(MenuButton("clans"))
@@ -5841,8 +6226,8 @@ async def form_custom(
     if callback.message:
         if field_name == "photo_file_id":
             await callback.message.answer(
-                "Отправьте новое фото."
-)
+                "Отправьте новое фото или видео."
+            )
         else:
             await callback.message.answer(
                 f"Введите новое значение поля "
@@ -6242,6 +6627,52 @@ async def profile_photo(
         ProfileForm.photo_file_id,
         AdminProfileForm.photo_file_id,
     ),
+    F.video,
+)
+async def profile_video(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+):
+    video = message.video
+    thumb = video.thumbnail if video else None
+    await accept_profile_video(
+        message,
+        state,
+        bot,
+        video.file_id,
+        thumb.file_id if thumb else None,
+    )
+
+
+@router.message(
+    StateFilter(
+        ProfileForm.photo_file_id,
+        AdminProfileForm.photo_file_id,
+    ),
+    F.animation,
+)
+async def profile_animation(
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+):
+    animation = message.animation
+    thumb = animation.thumbnail if animation else None
+    await accept_profile_video(
+        message,
+        state,
+        bot,
+        animation.file_id,
+        thumb.file_id if thumb else None,
+    )
+
+
+@router.message(
+    StateFilter(
+        ProfileForm.photo_file_id,
+        AdminProfileForm.photo_file_id,
+    ),
     F.document,
 )
 async def profile_photo_document(
@@ -6252,10 +6683,22 @@ async def profile_photo_document(
     document = message.document
     mime = (document.mime_type or "") if document else ""
 
-    if not mime.startswith("image/") or document is None:
+    if document is None or not (
+        mime.startswith("image/") or mime.startswith("video/")
+    ):
         await message.answer(
-            "Отправьте фото или нажмите "
-            "«⏭️ Пропустить фото»."
+            "Отправьте фото или видео, либо нажмите «⏭️ Пропустить»."
+        )
+        return
+
+    if mime.startswith("video/"):
+        thumb = document.thumbnail
+        await accept_profile_video(
+            message,
+            state,
+            bot,
+            document.file_id,
+            thumb.file_id if thumb else None,
         )
         return
 
@@ -6275,8 +6718,7 @@ async def profile_photo_document(
 )
 async def profile_photo_invalid(message: Message):
     await message.answer(
-        "Отправьте фото или нажмите "
-        "«⏭️ Пропустить фото»."
+        "Отправьте фото или видео, либо нажмите «⏭️ Пропустить»."
     )
 
 
@@ -6597,6 +7039,121 @@ async def notify_incoming_like(
         print(f"Не удалось сообщить о лайке {liked_id}: {error}")
 
 
+def match_open_keyboard(other_id: int) -> InlineKeyboardMarkup:
+    username = telegram_username(other_id)
+
+    if username:
+        button = InlineKeyboardButton(
+            text="Открыть Telegram",
+            url=f"https://t.me/{username}",
+        )
+    else:
+        # tg://user?id= в url-кнопке Telegram отклоняет без username
+        # (BUTTON_USER_PRIVACY_RESTRICTED) и роняет всё сообщение.
+        button = InlineKeyboardButton(
+            text="Открыть Telegram",
+            callback_data=f"match:open:{other_id}",
+        )
+
+    return InlineKeyboardMarkup(inline_keyboard=[[button]])
+
+
+async def send_username_fallback(
+    bot: Bot,
+    chat_id: int,
+    other_id: int,
+) -> None:
+    username = telegram_username(other_id)
+
+    if username:
+        await bot.send_message(
+            chat_id,
+            f"Открыть профиль: https://t.me/{username}",
+            parse_mode=None,
+        )
+        return
+
+    text, entities = no_username_message(other_id)
+    await bot.send_message(
+        chat_id,
+        text,
+        entities=entities,
+        parse_mode=None,
+    )
+
+
+def no_username_message(
+    other_id: int,
+) -> tuple[str, list[MessageEntity]]:
+    """Текст «нет @username». {name} — кликабельное имя, {id} — Telegram ID."""
+    profile = get_profile(other_id)
+    nickname = ""
+
+    if profile and str(profile["nickname"] or "").strip():
+        nickname = str(profile["nickname"]).strip()
+
+    first_name = stored_first_name(other_id) or nickname or "Игрок"
+    visible = nickname or first_name
+    template = (get_message_text("match_no_username") or "").strip()
+
+    if "{name}" not in template:
+        template = DEFAULT_MESSAGES["match_no_username"]
+
+    text = ""
+    entities: list[MessageEntity] = []
+    cursor = 0
+    named = False
+
+    for match in re.finditer(r"\{(name|id)\}", template):
+        text += template[cursor:match.start()]
+        token = match.group(1)
+
+        if token == "name":
+            if not named:
+                entities.append(
+                    MessageEntity(
+                        type="text_mention",
+                        offset=_text_units(text),
+                        length=_text_units(visible),
+                        user=User(
+                            id=other_id,
+                            is_bot=False,
+                            first_name=(first_name or "Игрок")[:64],
+                        ),
+                    )
+                )
+                named = True
+
+            text += visible
+        else:
+            text += str(other_id)
+
+        cursor = match.end()
+
+    text += template[cursor:]
+
+    if len(text) > 4096:
+        template = DEFAULT_MESSAGES["match_no_username"]
+        text = (
+            template.replace("{name}", visible).replace("{id}", str(other_id))
+        )
+        name_at = template.find("{name}")
+        entities = [
+            MessageEntity(
+                type="text_mention",
+                offset=_text_units(template[:name_at]),
+                length=_text_units(visible),
+                user=User(
+                    id=other_id,
+                    is_bot=False,
+                    first_name=(first_name or "Игрок")[:64],
+                ),
+            )
+        ]
+
+    return text, entities
+
+
 async def notify_match(
     bot: Bot,
     first_id: int,
@@ -6618,23 +7175,12 @@ async def notify_match(
         (first_id, second, second_id),
         (second_id, first, first_id),
     ):
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="Открыть Telegram",
-                        url=f"tg://user?id={other_id}",
-                    )
-                ]
-            ]
-        )
-
         try:
             await deliver_profile(
                 bot,
                 user_id,
                 other,
-                reply_markup=keyboard,
+                reply_markup=match_open_keyboard(other_id),
                 prefix=match_prefix,
                 force_photo=True,
             )
@@ -6642,6 +7188,18 @@ async def notify_match(
             print(
                 f"Не удалось отправить уведомление "
                 f"{user_id}: {error}"
+            )
+            continue
+
+        if telegram_username(other_id):
+            continue
+
+        try:
+            await send_username_fallback(bot, user_id, other_id)
+        except Exception as error:
+            print(
+                f"Не удалось открыть профиль без username "
+                f"{other_id} для {user_id}: {error}"
             )
 
 
@@ -6751,10 +7309,45 @@ async def process_likeback(
             )
 
 
+@router.callback_query(F.data.startswith("match:open:"))
+async def match_open_contact(
+    callback: CallbackQuery,
+    bot: Bot,
+):
+    parts = (callback.data or "").split(":")
+
+    if len(parts) != 3 or not parts[2].isdigit():
+        await callback.answer(
+            "Профиль не найден.",
+            show_alert=True,
+        )
+        return
+
+    other_id = int(parts[2])
+
+    try:
+        await send_username_fallback(
+            bot,
+            callback.from_user.id,
+            other_id,
+        )
+    except Exception as error:
+        print(f"Открыть профиль {other_id}: {error}")
+        await callback.answer(
+            "Не удалось открыть профиль. "
+            "Попросите человека указать @username в Telegram.",
+            show_alert=True,
+        )
+        return
+
+    await callback.answer()
+
+
 @router.callback_query(F.data.startswith("swipe:"))
 async def process_swipe(
     callback: CallbackQuery,
     bot: Bot,
+    state: FSMContext,
 ):
     _, action, target_text = callback.data.split(":")
     target_id = int(target_text)
@@ -6777,34 +7370,19 @@ async def process_swipe(
         return
 
     if action == "report":
-        DB.execute(
-            """
-            INSERT INTO reports (
-                reporter,
-                reported,
-                created,
-                resolved
-            )
-            VALUES (?, ?, ?, 0)
-            """,
-            (
-                user_id,
-                target_id,
-                current_time(),
-            ),
-        )
-
-        DB.commit()
-
-        await callback.answer(
-            "Жалоба отправлена.",
-            show_alert=True,
-        )
+        await state.set_state(ReportForm.reason)
+        await state.update_data(report_target=target_id)
+        await callback.answer()
 
         if callback.message:
-            await search_next(
-                callback.message,
-                user_id,
+            try:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            except Exception as error:
+                print(f"Кнопки жалобы: {error}")
+
+            await callback.message.answer(
+                "Напишите причину жалобы одним сообщением.\n"
+                "Отмена — /cancel"
             )
 
         return
@@ -6877,6 +7455,101 @@ async def process_swipe(
             callback.message,
             user_id,
         )
+
+
+def add_report(reporter_id: int, reported_id: int, reason: str) -> int:
+    cursor = DB.execute(
+        """
+        INSERT INTO reports (
+            reporter,
+            reported,
+            created,
+            resolved,
+            reason
+        )
+        VALUES (?, ?, ?, 0, ?)
+        """,
+        (
+            reporter_id,
+            reported_id,
+            current_time(),
+            reason,
+        ),
+    )
+    DB.commit()
+    return int(cursor.lastrowid)
+
+
+def report_button_label(report) -> str:
+    reason = " ".join(str(report["reason"] or "").split())
+    nickname = str(report["nickname"] or "").strip() or "анкета удалена"
+
+    if not reason:
+        reason = "без причины"
+
+    return f"{reason} · {nickname}"[:64]
+
+
+@router.message(StateFilter(ReportForm.reason), F.text)
+async def report_reason(
+    message: Message,
+    state: FSMContext,
+):
+    text = (message.text or "").strip()
+
+    if menu_button_key(text) or text.startswith("/"):
+        await message.answer(
+            "Сначала напишите причину жалобы или нажмите /cancel."
+        )
+        return
+
+    reason = " ".join(text.split())
+
+    if len(reason) < 2:
+        await message.answer(
+            "Причина слишком короткая. Опишите, что не так."
+        )
+        return
+
+    if len(reason) > 1000:
+        reason = reason[:1000]
+
+    data = await state.get_data()
+    target_id = int(data.get("report_target") or 0)
+    target = get_profile(target_id)
+
+    if target_id <= 0 or not target or not target["active"]:
+        await state.clear()
+        await message.answer(
+            "Анкета уже недоступна, жалоба не отправлена.",
+            reply_markup=keyboard_for(message.from_user.id),
+        )
+        return
+
+    try:
+        add_report(message.from_user.id, target_id, reason)
+    except Exception as error:
+        DB.rollback()
+        print(f"Жалоба {message.from_user.id}: {error}")
+        await message.answer(
+            "Не удалось отправить жалобу. Напишите причину ещё раз.",
+            parse_mode=None,
+        )
+        return
+
+    await state.clear()
+    await message.answer(
+        "Жалоба отправлена.",
+        reply_markup=keyboard_for(message.from_user.id),
+    )
+    await search_next(message, message.from_user.id)
+
+
+@router.message(StateFilter(ReportForm.reason))
+async def report_reason_invalid(message: Message):
+    await message.answer(
+        "Причину нужно написать текстом или нажать /cancel."
+    )
 
 
 # ============================================================
@@ -10045,37 +10718,15 @@ async def admin_callback(
         await callback.answer()
 
         if callback.message:
-            photo = profile_photo_source(profile["photo_file_id"])
             keyboard = admin_profile_keyboard(
                 user_id,
                 bool(profile["active"]),
                 callback.from_user.id,
             )
-
-            # Карточка как у игрока: фото и все поля, кроме скрытых.
-            # Кнопки на фото; удаление идёт через edit_or_send, он умеет медиа.
-            if photo and len(text) <= 1024:
-                try:
-                    await callback.message.answer_photo(
-                        photo=photo,
-                        caption=text,
-                        reply_markup=keyboard,
-                    )
-                    return
-                except Exception as error:
-                    print(f"Фото анкеты {user_id}: {error}")
-                    text += "\n\n⚠️ Фото анкеты недоступно."
-            elif photo:
-                try:
-                    await callback.message.answer_photo(
-                        photo=profile_photo_source(profile["photo_file_id"]),
-                    )
-                except Exception as error:
-                    print(f"Фото анкеты {user_id}: {error}")
-                    text += "\n\n⚠️ Фото анкеты недоступно."
-
-            await callback.message.answer(
-                text,
+            await send_media_card(
+                callback.message,
+                media_raw=profile["photo_file_id"],
+                text=text,
                 reply_markup=keyboard,
             )
 
@@ -10452,6 +11103,7 @@ async def admin_callback(
                 r.id,
                 r.reporter,
                 r.reported,
+                r.reason,
                 p.nickname
             FROM reports r
             LEFT JOIN profiles p
@@ -10477,15 +11129,10 @@ async def admin_callback(
         buttons = []
 
         for report in reports:
-            nickname = report["nickname"] or "анкета удалена"
-
             buttons.append(
                 [
                     InlineKeyboardButton(
-                        text=(
-                            f"Жалоба #{report['id']} — "
-                            f"{nickname}"
-                        )[:64],
+                        text=report_button_label(report),
                         callback_data=(
                             f"admin:report:{report['id']}"
                         ),
@@ -10507,7 +11154,9 @@ async def admin_callback(
         if callback.message:
             await edit_or_send(
                 callback.message,
-                "Открытые жалобы:",
+                "<b>Открытые жалобы</b>\n\n"
+                "На кнопке — причина и анкета. "
+                "Нажмите, чтобы открыть жалобу целиком.",
                 reply_markup=InlineKeyboardMarkup(
                     inline_keyboard=buttons,
                 ),
@@ -10536,24 +11185,23 @@ async def admin_callback(
             return
 
         profile = get_profile(report["reported"])
+        reason = str(report["reason"] or "").strip() or "не указана"
+        reason = html.escape(reason)
 
         text = (
-            f"Жалоба №{report_id}\n"
+            f"<b>Жалоба №{report_id}</b>\n"
+            f"Причина:\n{reason}\n\n"
             f"Отправитель: "
             f"<code>{report['reporter']}</code>\n"
             f"На пользователя: "
             f"<code>{report['reported']}</code>"
         )
 
-        if profile:
-            text += (
-                "\n\n"
-                + profile_text(
-                    profile,
-                    reveal_contacts=False,
-                    contact_note="",
-                )
-            )
+        if not profile:
+            text += "\n\nАнкета уже удалена."
+
+        if len(text) > 4000:
+            text = text[:3999] + "…"
 
         buttons = [
             [
@@ -10586,17 +11234,29 @@ async def admin_callback(
                 ),
             ],
         ]
+        keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
 
         await callback.answer()
 
         if callback.message:
-            await edit_or_send(
-                callback.message,
-                text,
-                reply_markup=InlineKeyboardMarkup(
-                    inline_keyboard=buttons,
-                ),
-            )
+            if profile:
+                await edit_or_send(
+                    callback.message,
+                    text,
+                )
+                await send_profile(
+                    callback.message,
+                    profile,
+                    reply_markup=keyboard,
+                    reveal_contacts=False,
+                    contact_note="",
+                )
+            else:
+                await edit_or_send(
+                    callback.message,
+                    text,
+                    reply_markup=keyboard,
+                )
 
         return
 
@@ -11354,6 +12014,17 @@ async def admin_message_select(
             "длиннее 1024 символов, Telegram покажет фото и текст "
             "двумя сообщениями."
         )
+    elif key == "match_no_username":
+        hint += (
+            "\n\nЭто сообщение, если при взаимном лайке у человека "
+            "нет @username. Обычная ссылка тогда не открывается, "
+            "поэтому имя должно остаться кликабельным.\n"
+            "{name} — имя из анкеты. Его нужно оставить в тексте: "
+            "по нажатию откроется профиль Telegram.\n"
+            "{id} — Telegram ID. Эту строку можно переставить или убрать.\n"
+            "Фото здесь не используется. HTML-разметка не сработает: "
+            "сообщение уходит обычным текстом, чтобы имя осталось кнопкой."
+        )
     elif key == "clans_intro":
         hint += (
             "\n\nЭто текст кнопки «Кланы», когда кланы уже добавлены. "
@@ -11411,14 +12082,35 @@ async def admin_message_text(
             )
             return
 
+        if guard_key == "match_no_username" and "{name}" not in text:
+            await message.answer(
+                "Оставьте в тексте {name}.\n"
+                "На это место бот подставит имя, и по нажатию "
+                "откроется профиль Telegram.\n"
+                "{id} — Telegram ID, его можно убрать.",
+                parse_mode=None,
+            )
+            return
+
+        notice = (
+            "✅ Шаблон сохранён. Так он выглядит (в окне или "
+            "сообщении текст будет тот же):"
+        )
+
+        if guard_key == "match_no_username":
+            notice = (
+                "✅ Шаблон сохранён.\n"
+                "В чате {name} станет кликабельным именем, "
+                "{id} — Telegram ID."
+            )
+
         await finish_template_save(
             message,
             state,
             guard_key,
             text,
             None,
-            "✅ Шаблон сохранён. Так он выглядит (в окне или "
-            "сообщении текст будет тот же):",
+            notice,
         )
         return
 
